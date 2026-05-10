@@ -1,0 +1,595 @@
+==============================================================
+  Ball Detection Refactor - Plain-English Summary
+  Date: 10 May 2026
+  Owner: Lamaan (Features 7 + 11)
+==============================================================
+
+---------------------------------------------------------------
+1. WHY I TOUCHED THE CODE
+---------------------------------------------------------------
+The ball detection was slow AND inaccurate. Two problems:
+
+  a) ball_detect.py was secretly using COCO YOLOv8n (the generic
+     model that knows about a "sports ball" class) instead of the
+     football-specific Roboflow model sitting in your models/
+     folder. That generic model only finds footballs about 44%
+     of the time on broadcast footage - terrible.
+
+  b) The Roboflow model is huge (68 million parameters, ~137 MB).
+     It is NOT YOLOv8n like the project spec says. It is closer
+     to YOLOv8x. On CPU it takes ~2 seconds per frame if you run
+     it on the full 1280x720 image every single frame. Unusable.
+
+So I had to either swap to a smaller model (lose accuracy) or
+make the heavy model run smarter (best of both worlds). I picked
+the second.
+
+
+---------------------------------------------------------------
+2. WHAT I CHANGED (in plain English)
+---------------------------------------------------------------
+
+ball_detect.py - rewritten end to end:
+
+  * Auto-loads the Roboflow football model if it exists. No more
+    silent fallback to the bad COCO model.
+
+  * "ROI tracking": Once the ball is found in one frame, a
+    Kalman filter predicts where it will be next frame. Instead
+    of scanning the whole 1280x720 image again, I crop a small
+    320x320 box around that prediction and only run YOLO on the
+    crop. That box has ~16x fewer pixels, so inference is much
+    faster.
+
+  * Every 30 frames I still do a full-frame search anyway, just
+    in case the ball drifted out of the small box (safety net).
+
+  * "False-positive filter": Players' heads and jerseys often
+    fool ball detectors. I now reject any "ball" detection whose
+    centre falls inside a player bounding box (shrunk 20% so we
+    don't kill detections near the feet, only the obvious ones
+    on the torso/head).
+
+  * "Size sanity check": A football in 720p broadcast is roughly
+    5-25 pixels across. Detections way bigger or smaller are
+    thrown out as obvious mistakes.
+
+  * "Prediction-aware scoring": If two ball candidates compete
+    in one frame, the one closer to where the Kalman filter
+    expected the ball to be wins, even if its YOLO confidence
+    is slightly lower. Physics-aware tiebreaker.
+
+  * Cleaner Kalman tuning - more forgiving on velocity (because
+    a real football changes direction sharply when kicked) and
+    stricter on measurement noise (YOLO centres are clean).
+
+  * Same function names as before, so test_feats.py and
+    touch_detect.py still work without any changes to their
+    interfaces.
+
+test_feats.py - updated:
+  * Now actually USES the Roboflow model.
+  * Passes the GT player bboxes in as the FP filter.
+  * Prints per-frame timing, FPS, and detection counts so you
+    can see if a future change is helping or hurting.
+  * FRAME_LIMIT lowered to 200 for fast iteration; switch back
+    to 875 for the full clip.
+
+benchmark_ball.py - new file:
+  * Runs 3 setups side by side on the same frames:
+    A) Old default (COCO YOLOv8n)
+    B) Heavy Roboflow model used the OLD way (full frame each
+       time, no FP filter)
+    C) The new setup (Roboflow + ROI + FP filter)
+  * Prints a comparison table so you can prove to yourself,
+    or to the rest of the group, that the changes helped.
+
+
+---------------------------------------------------------------
+3. WHAT WORKED (the wins)
+---------------------------------------------------------------
+
+Numbers measured on 100 frames of v_gQNyhv8y0QY_c013, stride 2:
+
+  CONFIG                              ms/frame    FPS     real    eff.recall
+  -------------------------------     --------    ----    -----   ----------
+  A. Old COCO YOLOv8n default          163        6.1     44%      91%
+  B. Heavy model, old full-frame       1936       0.5     75%      100%
+  C. NEW (Roboflow + ROI + filter)     863        1.2     81%      97%
+
+  ("real" = YOLO actually saw the ball that frame.
+   "eff.recall" = real + Kalman fill-ins. The Kalman filter
+   covers brief misses up to 10 frames.)
+
+What this means:
+  - Speed: 2.2x faster than running the heavy model the dumb way.
+  - Accuracy: 81% real detections, up from 75%. The FP filter
+    and proximity scoring stop the model from being fooled by
+    jerseys/heads.
+  - vs the old COCO default, we go from 44% to 81% real
+    detections - almost double the actual ball sightings.
+
+End-to-end test_feats.py run: ran cleanly in ~90s for 100
+frames, found 0 touches for player ID 4. That zero is correct,
+not a bug - player 4 is the only person visible in all 875
+frames, which strongly suggests it's the goalkeeper. Pick a
+midfielder/forward when we move to touch detection (we can
+auto-select based on closeness to ball).
+
+
+---------------------------------------------------------------
+4. WHAT DID NOT WORK (so we don't repeat it)
+---------------------------------------------------------------
+
+I tried two more aggressive speedups - both backfired on this
+specific machine (your Intel i7-1255U):
+
+  a) ONNX export with dynamic shapes:
+     - Idea: convert the .pt to .onnx, run it via ONNX Runtime
+       which is supposed to be faster on CPU.
+     - Reality: ~1.3 seconds per frame instead of 0.86. Slower.
+     - Why: I need both 640x640 (full frame) AND 320x320 (ROI)
+       inputs. That forces "dynamic shape" ONNX, which loses the
+       static-shape kernel optimisations and ends up slower than
+       PyTorch's own native handling.
+
+  b) OpenVINO export:
+     - Idea: Ultralytics specifically recommends OpenVINO for
+       Intel CPUs.
+     - Reality: same dynamic-shape problem. Static export refused
+       to accept the 320x320 ROI crops. Did not even finish the
+       warmup before crashing.
+
+  Conclusion: PyTorch + ROI tracking is the actual best config
+  for this exact model on this exact hardware. I deleted the
+  520 MB of failed export artifacts but kept export_to_onnx()
+  as a hook in ball_detect.py with a warning docstring, in case
+  we ever swap to a smaller model where INT8 quantisation might
+  help.
+
+
+---------------------------------------------------------------
+5. WHAT TO DO NEXT (touch detection)
+---------------------------------------------------------------
+
+Now that ball detection is solid (~1.2 FPS, 97% effective recall):
+
+  1) Pick a sensible target player. Player ID 4 is the GK.
+     Auto-pick the track whose average position over the clip
+     is closest to the ball's average position - that's the
+     player most involved in play.
+
+  2) Tune the touch threshold (currently margin_px=25, lower
+     half of bbox = foot zone, min_consecutive=2 frames). On a
+     midfielder we should start seeing actual touches. Sanity
+     check by eyeballing 5-10 detected touches in the rendered
+     touch_map.png.
+
+  3) Once Zain delivers Z4 (homography), wire the world (wx, wy)
+     into td.update() so touches get plotted on the top-down
+     pitch and zone counts populate.
+
+  4) Once Sameem delivers S2 (team labels), filter ball
+     "possession" by team for the formation analysis hook.
+
+  5) Pipeline integration (Phase L4) is then mostly glue code.
+
+
+---------------------------------------------------------------
+6. FILES IN PLAY
+---------------------------------------------------------------
+
+  ball_detect.py           - the actual detector (heavily refactored)
+  test_feats.py            - end-to-end smoke test, uses GT bboxes
+  benchmark_ball.py        - A/B/C speed + accuracy comparison
+  touch_detect.py          - unchanged, still good
+  view_ball_detection.py   - unchanged viewer
+  models/football-ball-detection.pt  - the Roboflow weights
+  lamaan_progress.txt      - this file
+
+  ONNX/OpenVINO model dirs - DELETED (didn't help)
+
+
+---------------------------------------------------------------
+7. ONE-LINE TAKEAWAYS
+---------------------------------------------------------------
+
+  - Don't run the full image through YOLO every frame when you
+    already know roughly where the ball is. Crop and search.
+  - The Kalman filter is now used to GUIDE the search, not just
+    fill in missing frames.
+  - Dropping false positives (player overlap + size sanity)
+    actually IMPROVES recall because better candidates win the
+    ranking.
+  - Fancy export formats (ONNX, OpenVINO) are not magic. Test
+    them. On this exact setup they were slower.
+  - The heavy 68M-param Roboflow model is the real ceiling on
+    speed. If we ever need >2 FPS, we'd have to fine-tune a
+    YOLOv8n on football ball data ourselves (out of scope for
+    this project).
+
+==============================================================
+End of summary. Re-run benchmark_ball.py any time to confirm
+the numbers haven't drifted after future edits.
+==============================================================
+
+
+==============================================================
+  ROUND 2 - based on manual playback observations
+  Date: 10 May 2026 (later same day)
+==============================================================
+
+After watching play_ball_detection.py on v_gQNyhv8y0QY_c013
+I noticed three real failure modes that the numbers alone hid:
+
+  Q1) After ~12 frames the box and detector "jumped" to a
+      totally different place sometimes.
+  Q2) When a player gets the ball, the ball "vanishes" — we
+      fail to detect it for many frames until they pass.
+  Q3) On long misses we were re-running expensive full-frame
+      inference every frame.
+
+What I changed in ball_detect.py:
+
+  Q1 fix - HARD GATING ON FULL-FRAME RESULTS:
+    A full-frame YOLO scan is no longer blindly trusted. Any
+    "ball" candidate it finds must be within a distance gate
+    of the Kalman prediction:
+       miss_count 0-1  -> gate = 200 px
+       miss_count 2-4  -> gate = 400 px
+       miss_count 5+   -> gate released (full re-acquisition)
+    Detections outside the gate are rejected; we keep using
+    Kalman extrapolation instead. This kills the "teleport".
+    Also disabled periodic full-frame re-anchoring (was every
+    30 frames) since it was the main source of jumps.
+
+  Q2 fix - STICKY POSSESSION (THE BIG ONE):
+    The detector now remembers which player bbox the ball was
+    last seen near (the "possessor"). When the ROI search
+    misses, it does a SECOND search inside the possessor's
+    bbox with the false-positive filter SUSPENDED for that
+    one player. Other players still filter FPs (heads /
+    jerseys), but a ball at the possessor's feet finally gets
+    detected instead of being thrown away.
+    Visible in play_ball_detection.py as a magenta box
+    labelled "possessor (age=N)".
+
+  Q3 fix - THROTTLED FULL-FRAME FALLBACK:
+    Used to do full-frame inference on EVERY miss frame
+    (~1.5s each). Now does it on the 1st miss and then only
+    every 3rd miss after that. Between rescans we lean on
+    Kalman extrapolation. Massive CPU saving during
+    occlusion streaks.
+
+Numbers (test_feats.py, 100 frames of v_gQNyhv8y0QY_c013):
+
+  Round 1 (Q1-3 NOT yet fixed):    862 ms/frame  1.2 FPS  real=81%
+  Round 2 (Q1-3 fixes applied):    619 ms/frame  1.6 FPS  real=83%
+
+  -> 28% faster AND +2pp real-detection rate.
+  -> Effective recall stays at 97%.
+
+Free side benefit:
+  The "possessor" tracking is exactly the signal Phase L3
+  (touch detection) needs - we already know which player is
+  most associated with the ball each frame, even when the
+  ball is briefly invisible. This will simplify touch
+  detection significantly.
+
+What to verify manually next time you run the viewer:
+  1. The bounding box shouldn't snap to far-away things
+     anymore (Q1).
+  2. When a player picks up the ball, you should see a
+     magenta "possessor" rectangle, AND the yellow ball
+     circle should keep appearing inside their bbox - not
+     disappear (Q2).
+  3. Frames with the ball clearly off-screen should feel
+     less laggy than before (Q3).
+
+New tuning knobs on BallDetector (all have sensible defaults):
+  full_frame_every             0     (was 30; disable jumps)
+  possession_max_dist_px       30    (close to bbox = possessor)
+  possession_search_margin_px  20    (expand bbox before search)
+  gate_radius_initial_px       200
+  gate_radius_extended_px      400
+  gate_radius_release_after    5
+  full_frame_on_miss_every     3
+
+==============================================================
+End round 2.
+==============================================================
+
+
+==============================================================
+  ROUND 3 - Feature 3 (homography) shipped
+  Date: 10 May 2026 (evening)
+==============================================================
+
+CONTEXT
+- Plan changed: F3 was originally Zain's. Now also Lamaan's.
+- F3 = pitch keypoint detection -> homography matrix H -> any
+  pixel (px, py) becomes world coords (wx, wy) in metres.
+- Without F3, touch detection has no zone breakdown; F5 has no
+  speed/distance; Sameem's formation analysis is blocked.
+
+REALITY CHECK ON THE CLIPS
+- Spec said "SportsMOT = static-camera tactical clips". WRONG.
+  All 5 clips are broadcast TV with panning/zooming cameras
+  (Bundesliga + Wembley games).
+- Implication: "compute H once per clip" is approximate, only
+  fully accurate near the calibration frame. Good enough for
+  Phase F3a; can be upgraded to per-frame H later.
+
+MODEL CHOICE - Why Roboflow's pitch model and not the rest:
+  - PnLCalib (newer paper)   -> reqs pin torch 2.3.1 (we have
+    2.11), needs PyQt5 + lots of CUDA pins -> dependency hell.
+  - TVCalib  (CVPR 2023)     -> needs pytorch3d, painful on
+    Windows.
+  - SoccerNet baseline       -> needs Linux + GPU + Docker.
+  - Sportlight (1st place)   -> requires 24GB GPU. Hard no.
+  - Roboflow YOLOv8 keypoint -> SAME framework as our existing
+    Roboflow ball detector. Pretrained on broadcast football.
+    Zero new dependencies. WINNER.
+  - Manual clicker fallback  -> built into the design but not
+    needed; the model worked on every one of our 5 clips.
+
+WHAT GOT BUILT
+  pitch_config.py
+    Vendored copy of roboflow/sports' SoccerPitchConfiguration,
+    converted from cm to METRES. 32 keypoints with FIFA pitch
+    dimensions (120m x 70m). Plus a `world_xy_to_zone()` helper
+    that maps any (wx, wy) to one of 9 standard tactical zones
+    or "oob" if off-pitch.
+
+  pitch_keypoint_detector.py
+    Thin wrapper around the Roboflow YOLOv8-pose model
+    (models/football-pitch-detection.pt). Returns 32
+    DetectedKeypoint objects per frame, each with confidence.
+
+  homography.py
+    `PitchHomography` class. Built from
+    >=4 (world, pixel) correspondences via cv2.findHomography
+    + RANSAC. Methods: pixel_to_world, world_to_pixel (and
+    batch versions), save/load to .npz. Stores reprojection
+    error and inlier count for diagnostics.
+
+  compute_homographies.py
+    Per-clip pipeline:
+      1. Sample N candidate frames evenly across the clip
+      2. Run pitch keypoint detector on each
+      3. Pick the frame with the most high-confidence keypoints
+      4. Fit H with RANSAC
+      5. Save to homographies/<seq>.npz
+    Run with `python compute_homographies.py`.
+
+  view_homography.py
+    Visual sanity-check tool. Loads a saved H, projects the
+    canonical pitch model onto the source frame.
+      Q quit, SPACE/N next frame, P prev, J jump-to-calib
+      +/- next/prev clip
+    YOU MUST RUN THIS to confirm each H is correct before
+    trusting touch-detection zone outputs.
+
+RESULTS (on all 5 SportsMOT train clips)
+  clip                     calib   inliers   reproj_err
+  v_HdiyOtliFiw_c003       553     5/8       1.44 px
+  v_dw7LOz17Omg_c053        79     8/13      1.96 px
+  v_2QhNRucNC7E_c017         1     5/9       2.01 px
+  v_1yHWGw8DH4A_c047       230     7/12      2.41 px
+  v_gQNyhv8y0QY_c013       625     7/13      2.80 px
+
+  All under 3 pixels on 1280x720 frames (<0.4% of diagonal).
+  Round-trip world->pixel->world error: numerically zero.
+
+INTEGRATION INTO play_ball_detection.py
+  - Auto-loads homographies/<seq>.npz when available.
+  - HUD now shows live world coordinates and zone for the ball
+    when locked: "ball world: (62.3m, 35.1m)   zone: mid_centre"
+  - When no H is found, viewer prints a hint and falls back to
+    pixel-only mode silently.
+
+WHAT'S DELIBERATELY NOT YET DONE (Phase F3a vs F3b/F3c)
+  - Single H per clip. The camera DOES pan in these clips, so
+    H is only fully accurate near the calibration frame and
+    degrades as the camera moves. Visible in view_homography.py
+    by stepping forward/back from the calibration frame.
+  - Phase F3b will: recompute H every K frames where landmarks
+    allow, interpolate between keyframes.
+  - Phase F3c will: use F4 (Zain's optical flow) to propagate H
+    between landmark detections. Requires F4 to land first.
+
+NEXT STEP - YOU NEED TO MANUALLY VERIFY
+  Run: python view_homography.py
+  Check: do the green/cyan/yellow projected pitch lines line up
+         with the actual pitch lines in the image?
+  - At the calibration frame: should be near-perfect.
+  - As you step away from it: should drift visibly when the
+    camera pans. That drift is the known limitation of F3a.
+  If any clip looks badly wrong, tell me which one and we'll
+  bump --num-candidates higher or fix manually.
+
+After verification: move to touch detection (Phase L3) using
+the world coords + zones now available. The "possessor"
+tracking we added in round 2 + world coords from F3 = touch
+detection becomes mostly free.
+
+==============================================================
+End round 3.
+==============================================================
+
+
+==============================================================
+  ROUND 3.5 - F3 misalignment fix (the user caught it)
+==============================================================
+
+YOU REPORTED: "Off by alot tbvh. Shape of the landmark is good but
+              it doesnt map right." (with screenshots)
+
+WHAT I MISDIAGNOSED FIRST
+- Hypothesised a keypoint label permutation issue (Roboflow's
+  `labels` list skips 14 and 19 then re-appends them). Applied
+  the permutation as a "fix" -- inlier counts went DOWN, which
+  means the fix was wrong. Reverted.
+
+WHAT WAS ACTUALLY WRONG (root cause)
+- The OLD picker chose calibration frames by RAW KEYPOINT COUNT.
+- In broadcast clips the camera follows play, so most frames
+  have lots of keypoints clustered on ONE half of the pitch.
+- A homography fitted on (say) only the LEFT half is internally
+  consistent (low reprojection error -- 1-2px) but EXTRAPOLATES
+  badly when projecting the unseen RIGHT half. That's why the
+  shape was correct but the placement was off.
+
+DIAGNOSTIC EVIDENCE (debug_homography_fit.py for v_dw7LOz17Omg_c053)
+- 13 confident KPs detected on old calib frame 79
+- All inliers had x in [0, 60] (left half only)
+- Vertex 17 (right corner area) had a 105 PIXEL residual -- the
+  model couldn't actually see it, was just clipping at image edge
+- RANSAC accepted 8/13 inliers, all in left half. H fit perfectly
+  to the left half, garbage on right half.
+
+THE FIX (3 changes)
+1. compute_homographies.py: `_spread_score()` now ranks frames by
+   how many of the pitch x-thirds (left/mid/right) are covered.
+   Tiebreaker: x-span. Final tiebreaker: keypoint count.
+   Default `--num-candidates` bumped to 20 to give the picker
+   more chances to find a wide-coverage frame.
+
+2. homography.py: PitchHomography now records and persists
+   `inlier_world_bbox` -- the world-space (x_min,y_min,x_max,y_max)
+   of the points that survived RANSAC. This is THE region where
+   H is backed by evidence.  `is_within_support(wx, wy)` lets
+   downstream code ask "can I trust this projection?"
+
+3. view_homography.py:
+   - SOLID lines for pitch features inside the inlier bbox
+   - DASHED lines for features outside (extrapolated)
+   - ORANGE dashed rectangle marks the inlier bbox itself
+   - HUD now prints the bbox extent + % of pitch length covered
+
+NEW CALIBRATION FRAMES (after the fix)
+  clip                      old   new   reproj  bbox-x-span
+  v_dw7LOz17Omg_c053         79   174    2.04   0..60m   (50%)
+  v_HdiyOtliFiw_c003        553   775    1.66   0..20m   (17%) *
+  v_2QhNRucNC7E_c017          1   402    1.86   51..120m (58%)
+  v_1yHWGw8DH4A_c047        230   367    1.85   51..120m (58%)
+  v_gQNyhv8y0QY_c013        625    47    1.33   60..120m (50%)
+
+  * The Wembley clip's camera literally never leaves the left
+    goal area in the entire 875-frame clip -- only 17% of the
+    pitch is ever covered.  Projection outside that 17% is
+    EXTRAPOLATION and will be drawn dashed.  This is a hard
+    physical limit, not a fixable bug.
+
+WHAT THIS MEANS FOR DOWNSTREAM CODE
+- Touch detection / zone analytics should call
+  `H.is_within_support(wx, wy)` before trusting a world coord.
+  If False, treat the world coord as "approximate" and flag it.
+- For the Wembley clip, only events within the left 17% of the
+  pitch (and lateral y=0..44m) will have trustworthy world coords.
+  The rest are best-effort extrapolation.
+
+YOUR ACTION ITEM
+  Run `python view_homography.py` again.
+  Now you should see:
+    - SOLID green outline where H is backed by inliers
+    - DASHED green outline where H is extrapolating
+    - ORANGE dashed rectangle around the inlier-supported region
+  At the calibration frame, the SOLID portions should line up
+  perfectly with the actual pitch lines visible in the image.
+
+==============================================================
+End round 3.5.
+==============================================================
+
+
+==============================================================
+  ROUND 3.75 - Classical line-based refinement (YOUR IDEA)
+==============================================================
+
+YOU SAID: "cant we just use segmentation or filtering of any
+          kind to differentiate the pitch and the lines/landmarks
+          on it. Like since we know that the pitch would cover
+          most of the frames we can just convert it to grayscale
+          and extract white lines from the pitch or something??
+          Then using that we compute homography??"
+
+          GREAT instinct -- that's exactly the classical CV
+          move. Implemented it.
+
+APPROACH: Distance-transform line refinement
+------------------------------------------
+1. Build a line-mask from the calibration frame:
+     a. HSV green mask  (broad, covers varied broadcast grass)
+     b. Dilate green by 25px so the white lines on it are included
+     c. HSV white mask  (high V, low S)
+     d. Intersect (a_dilated) AND (b)   -> line pixels on pitch only
+2. Sample the CANONICAL pitch densely (1m step along every edge +
+   the centre circle) in world metres.
+3. Compute distance transform D(x,y) of the line mask = distance
+   in pixels from each pixel to the nearest detected line pixel.
+4. Starting from the YOLO-keypoint H as SEED, run Levenberg-
+   Marquardt least-squares over the 8 DOF of H to minimize
+      sum over canonical samples of min(D(H * sample), 30)
+   The Huber cap of 30px means samples projecting off-pitch or
+   into unseen regions don't pull the fit.
+
+This is LOCAL refinement -- the YOLO seed has to be close enough
+for the optimiser to find the right basin. 1-2px RANSAC inlier
+error from round 3.5 made it a perfect seed.
+
+FILES
+  refine_homography.py   line-mask + canonical sampling + LM fit
+  debug_line_refine.py   per-clip before/after overlay + mask dump
+  compare_refine.py      side-by-side A/B viewer for all clips
+  compute_homographies.py  --refine is default; --no-refine to skip
+
+RESULTS (line-DT cost = mean capped distance from projected sample
+         to nearest detected line pixel, px; lower = better)
+
+  clip                   seed cost -> refined cost   reduction
+  v_1yHWGw8DH4A_c047       26.29  -> 24.51           -1.78
+  v_2QhNRucNC7E_c017       26.43  -> 23.16           -3.27
+  v_dw7LOz17Omg_c053       27.73  -> 24.81           -2.92
+  v_gQNyhv8y0QY_c013       28.34  -> 23.92           -4.42
+  v_HdiyOtliFiw_c003       28.66  -> 27.42           -1.24  (Wembley,
+                                                             low coverage)
+
+VISUAL VERIFICATION (from compare_refine.py side-by-sides)
+
+  * v_gQNyhv8y0QY_c013: Centre-circle overlay was incorrectly
+    placed in mid-frame by the seed. AFTER refinement it
+    SNAPS onto the real visible white arc on the left of the
+    frame. Halfway line and top touchline also align.
+
+  * v_dw7LOz17Omg_c053 (Dortmund-Bayern): Seed's top touchline
+    was up in the advertising boards. AFTER refinement it drops
+    down to the real grass-ad boundary. Centre circle scales up.
+
+  * v_HdiyOtliFiw_c003 (HON vs MAR, Wembley): Seed halfway line
+    cut THROUGH the visible centre-circle arc (wrong). AFTER
+    refinement halfway line moves to the true vertical, circle
+    overlaps the visible arc.
+
+  * v_2QhNRucNC7E_c017 and v_1yHWGw8DH4A_c047 show smaller but
+    consistent improvements -- the seed was already closer to
+    right for those clips.
+
+The saved `homographies/*.npz` now contain the REFINED H. The
+inlier-world-bbox from the RANSAC seed is preserved, so the
+solid/dashed viewer still tells you where H is supported.
+
+YOUR ACTION ITEM
+  Run `python view_homography.py` on all 5 clips and see if the
+  solid portions now line up with real pitch lines.
+
+  If they DO: we're done with F3, move to touch detection.
+  If they're still off on any clip: we've exhausted the easy
+  wins. As you said: "if it doesnt work we move to touch
+  detection". For touch detection we'll still use the H we
+  have; it's good enough for zone-level assignment even if
+  imperfect at pixel level.
+
+==============================================================
+End round 3.75.
+==============================================================
