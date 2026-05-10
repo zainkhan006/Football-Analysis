@@ -5,9 +5,12 @@ venv/
 # Dataset (too large for git)
 dataset/
 
-# Model weights (too large for git — download separately)
-models/
-yolov8n.pt
+# Roboflow model weights (~137MB each — exceed GitHub 100MB limit)
+# Run `python setup_models.py` to download them
+models/*.pt
+
+# yolov8n.pt is small (6.5MB) and IS tracked in git
+# (no exclude rule needed — it's in the repo root)
 
 # Python cache
 __pycache__/
