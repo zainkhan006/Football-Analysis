@@ -2,7 +2,7 @@
 Feature 8 — Team Assignment  (robust rewrite)
 ==============================================
 S1  crop_jersey(frame, bbox)   → BGR patch
-S2  assign_teams(frame, entries, cfg) → {track_id: "home"|"away"|"ref_gk"}
+S2  assign_teams(frame, entries, cfg) → {track_id: "home"|"away"|"gk"}
 
 Design goals
 ------------
@@ -20,7 +20,7 @@ Pipeline per frame
     └─► crop_jersey()       — extract torso band, multi-sample fallback
           └─► _describe()   — HSV histogram feature vector (no hard mask)
                 └─► _kmeans_robust() — k=2 with outlier bucket
-                      └─► _resolve_labels() — map cluster→home/away/ref_gk
+                      └─► _resolve_labels() — map cluster→home/away/gk
                             └─► {track_id: label}
 
 Folder layout expected
@@ -86,11 +86,11 @@ class FeatureConfig:
     # Final feature dim = hue_bins + sat_bins + val_bins = 24 by default
 
     # ── Outlier detection (referee / GK) ──────────────────────────────
-    # A track is tagged "ref_gk" if its distance to BOTH team centroids
+    # A track is tagged "gk" if its distance to BOTH team centroids
     # exceeds this fraction of the centroid-to-centroid distance.
-    outlier_threshold: float = 0.55
+    outlier_threshold: float = 0.50
     # Suppress outlier flagging when either cluster has fewer than this many
-    # members — prevents a lone attacker from being wrongly tagged ref_gk.
+    # members — prevents a lone attacker from being wrongly tagged gk.
     min_cluster_size_for_outlier: int = 2
 
     # ── K-means ───────────────────────────────────────────────────────
@@ -102,7 +102,7 @@ class FeatureConfig:
     # Once centroids are computed for the first "anchor" frame batch,
     # subsequent frames use them as warm-start seeds (prevents cluster
     # flip between frames).
-    anchor_frames: int = 5      # number of frames pooled for initial centroids
+    anchor_frames: int = 5     # number of frames pooled for initial centroids
 
     # ── Minimum tracks needed to run K-means ──────────────────────────
     min_tracks_for_kmeans: int = 4
@@ -305,7 +305,7 @@ def _resolve_labels(
     prev_centroids: Optional[np.ndarray],  # from last frame — prevents flip
 ) -> Dict[int, str]:
     """
-    Map cluster indices 0/1/2 to "home"/"away"/"ref_gk".
+    Map cluster indices 0/1/2 to "home"/"away"/"gk".
 
     Flip prevention
     ---------------
@@ -331,7 +331,7 @@ def _resolve_labels(
 
     label_map = {0: "away" if swap else "home",
                  1: "home" if swap else "away",
-                 2: "ref_gk"}
+                 2: "gk"}
 
     for tid, lbl in zip(track_ids, labels):
         result[tid] = label_map[lbl]
@@ -350,7 +350,7 @@ def assign_teams(
     init_centroids: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[int, str], Optional[np.ndarray]]:
     """
-    Assign every tracked player to home / away / ref_gk for one frame.
+    Assign every tracked player to home / away / gk for one frame.
 
     Parameters
     ----------
@@ -363,7 +363,7 @@ def assign_teams(
 
     Returns
     -------
-    labels     : {track_id: "home"|"away"|"ref_gk"}
+    labels     : {track_id: "home"|"away"|"gk"}
     centroids  : (2, D) float32 — updated centroids (feed back as init_centroids)
                  Returns None if there were not enough tracks to cluster.
     """
@@ -384,18 +384,18 @@ def assign_teams(
         else:
             invalid_ids.append(tid)
 
-    # Not enough usable tracks — assign everything to ref_gk
+    # Not enough usable tracks — assign everything to gk
     if len(valid_ids) < cfg.min_tracks_for_kmeans:
-        fallback = {tid: "ref_gk" for tid in valid_ids + invalid_ids}
+        fallback = {tid: "gk" for tid in valid_ids + invalid_ids}
         return fallback, init_centroids
 
     feat_matrix = np.stack(valid_feats)   # (N, D)
     labels, centroids, _ = _kmeans_robust(feat_matrix, cfg, init_centroids)
     label_dict = _resolve_labels(valid_ids, labels, centroids, init_centroids)
 
-    # Invalid (too-small bbox) tracks marked ref_gk
+    # Invalid (too-small bbox) tracks marked gk
     for tid in invalid_ids:
-        label_dict[tid] = "ref_gk"
+        label_dict[tid] = "gk"
 
     return label_dict, centroids
 
@@ -410,9 +410,9 @@ def majority_vote_labels(
     """
     Compute a stable, per-track final label by majority vote across all frames.
 
-    ref_gk is treated as uncertainty, not a real identity.  A track needs
+    gk is treated as uncertainty, not a real identity.  A track needs
     more than 5% of its visible frames labelled home/away before it is
-    rescued from ref_gk.  ref_gk only wins if the track was never
+    rescued from gk.  gk only wins if the track was never
     confidently assigned a team label across the whole sequence.
     """
     votes: Dict[int, Dict[str, int]] = {}
@@ -424,24 +424,33 @@ def majority_vote_labels(
             votes[tid][lbl] = votes[tid].get(lbl, 0) + 1
 
     final: Dict[int, str] = {}
+    rescue_log = []
+
     for tid, counts in votes.items():
         total_frames = sum(counts.values())
-        team_votes   = {k: v for k, v in counts.items() if k != "ref_gk"}
+        team_votes   = {k: v for k, v in counts.items() if k != "gk"}
         total_team   = sum(team_votes.values())
+        gk_frames    = counts.get("gk", 0)
 
-        if total_team > int((5 / 100) * total_frames):
+        if total_team > int((30 / 100) * total_frames):
             final[tid] = max(team_votes, key=team_votes.__getitem__)
+            if gk_frames > 0:
+                rescue_log.append(
+                    f"track #{tid} -> rescued to '{final[tid]}' "
+                    f"(was gk in {gk_frames} frames, "
+                    f"team label in {total_team}/{total_frames} frames)"
+                )
         else:
-            final[tid] = "ref_gk"
+            final[tid] = "gk"
 
-    return final
+    return final, rescue_log
 
 
 def apply_majority_vote(
     all_labels: Dict[int, Dict[int, str]],
 ) -> Dict[int, Dict[int, str]]:
     """Replace every per-frame label with the sequence-level majority-vote label."""
-    final_per_track = majority_vote_labels(all_labels)
+    final_per_track, rescue_log = majority_vote_labels(all_labels)
     stabilised: Dict[int, Dict[int, str]] = {}
     for fi, frame_labels in all_labels.items():
         stabilised[fi] = {
@@ -515,7 +524,7 @@ def run_sequence(
 _LABEL_COLOUR = {
     "home":   (60,  200, 60),    # green tint
     "away":   (60,  120, 220),   # blue tint
-    "ref_gk": (220, 180, 40),    # amber
+    "gk": (220, 180, 40),    # amber
     "?":      (120, 120, 120),
 }
 
@@ -789,9 +798,22 @@ def run_feature8(
 
         # ── Majority-vote stabilisation ───────────────────────────────
         stable_labels = apply_majority_vote(raw_labels)
-        voted = majority_vote_labels(raw_labels)
+        voted, rescue_log = majority_vote_labels(raw_labels)
+
+        log_path = seq_out / "gk_rescue_log.txt"
+        with open(log_path, "w") as f:
+            if rescue_log:
+                f.write(f"GK Rescue Log — {seq_dir.name}\n")
+                f.write("=" * 50 + "\n")
+                for line in rescue_log:
+                    f.write(line + "\n")
+            else:
+                f.write("No tracks were rescued from gk.\n")
+        print(f"[{seq_dir.name}] rescue log → {log_path}")
+
+
         print(f"[{seq_dir.name}] majority-vote final assignments: "
-              + ", ".join(f"#{tid}→{lbl}" for tid, lbl in sorted(voted.items())))
+              + ", ".join(f"#{tid}->{lbl}" for tid, lbl in sorted(voted.items())))
 
         # ── Pass 2: write visualisation images using stable labels ────
         for fi, entries in sorted(frame_entries.items()):
@@ -810,6 +832,19 @@ def run_feature8(
             overlay = draw_overlay(frame, entries, labels)
             cv2.imwrite(str(overlays_out / f"overlay_frame_{fi:03d}.jpg"), overlay)
 
+            # Save individual jersey crops per team
+            for tid, bbox in entries:
+                lbl  = labels.get(tid, "?")
+                if lbl not in ("home", "away", "gk"):
+                    continue
+                jersey = crop_jersey(frame, bbox, cfg)
+                if jersey.shape[0] * jersey.shape[1] < cfg.min_crop_px:
+                    continue
+                team_dir = seq_out / "jersey_crops" / lbl
+                team_dir.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(team_dir / f"frame_{fi:03d}_track_{tid}.jpg"), jersey)
+
+
             counts: Dict[str, int] = {}
             for v in labels.values():
                 counts[v] = counts.get(v, 0) + 1
@@ -818,7 +853,7 @@ def run_feature8(
                   f"tracks={len(entries):2d} | "
                   f"home={counts.get('home',0):2d}  "
                   f"away={counts.get('away',0):2d}  "
-                  f"ref_gk={counts.get('ref_gk',0):2d}")
+                  f"gk={counts.get('gk',0):2d}")
 
         print(f"[{seq_dir.name}] done → crops: {crops_out} | overlays: {overlays_out}")
 
@@ -827,24 +862,62 @@ def run_feature8(
 # CLI
 # ══════════════════════════════════════════════════════════════════════
 
+#if __name__ == "__main__":
+#
+#    here        = Path(__file__).parent
+#    videos_root = here / "videos"
+#
+#    for seq_dir in sorted(videos_root.iterdir()):
+#        if not seq_dir.is_dir():
+#            continue
+#
+#        all_frame_paths = _collect_frame_paths(str(seq_dir / "img1"))
+#        all_frame_indices = sorted(
+#            _frame_index_of(p)
+#            for p in all_frame_paths
+#            if _frame_index_of(p) >= 0
+#        )
+#
+#        print(f"Processing {len(all_frame_indices)} frames from {seq_dir.name}")
+#
+#        run_feature8(
+#            seq_filter=seq_dir.name,
+#            explicit_frames=all_frame_indices,
+#        )
+#
+
+
 if __name__ == "__main__":
 
-    # Process ONLY this sequence — all frames
-    SEQ_NAME = "v_dw7LOz17Omg_c053"
-
-    here    = Path(__file__).parent
-    img_dir = here / "videos" / SEQ_NAME / "img1"
-
-    all_frame_paths = _collect_frame_paths(str(img_dir))
+    # ── DEFINE WHICH SEQUENCE TO RUN ──────────────────────────────────
+    SEQ_NAME = "v_HdiyOtliFiw_c003"  # ← CHANGE THIS to your sequence name
+    
+    here = Path(__file__).parent
+    videos_root = here / "videos"
+    
+    # Process ONLY the specified sequence
+    seq_dir = videos_root / SEQ_NAME
+    
+    if not seq_dir.is_dir():
+        print(f"Error: Sequence '{SEQ_NAME}' not found in {videos_root}")
+        exit(1)
+    
+    all_frame_paths = _collect_frame_paths(str(seq_dir / "img1"))
     all_frame_indices = sorted(
         _frame_index_of(p)
         for p in all_frame_paths
         if _frame_index_of(p) >= 0
     )
-
-    print(f"Processing {len(all_frame_indices)} frames from {SEQ_NAME}")
-
+    
+    print(f"Processing {len(all_frame_indices)} frames from {seq_dir.name}")
+    
     run_feature8(
-        seq_filter=SEQ_NAME,
-        explicit_frames=all_frame_indices,   # ALL frames
+        seq_filter=seq_dir.name,
+        explicit_frames=all_frame_indices,
     )
+
+        
+        
+        
+
+
