@@ -110,7 +110,7 @@ def renderZoneBreakdown(zoneStats, pitchLengthM, pitchWidthM, outPath):
     channelLabels = ["left-flank", "left-half-space", "centre", "right-half-space", "right-flank"]
 
     fig, ax = plt.subplots(figsize=(13, 8))
-    drawPitchTemplate(ax, pitchLengthM, pitchWidthM)
+    plt.subplots_adjust(left=0.18)
     maxPct = max(zoneStats.values()) if zoneStats else 1.0
     for col, tl in enumerate(thirdLabels):
         for row, cl in enumerate(channelLabels):
@@ -132,10 +132,11 @@ def renderZoneBreakdown(zoneStats, pitchLengthM, pitchWidthM, outPath):
         ax.text(midX, -1.5, tl + " third", ha="center", fontsize=9, color="black", fontweight="bold")
     for row, cl in enumerate(channelLabels):
         midY = (channelsW[row] + channelsW[row + 1]) / 2
-        ax.text(-1.5, midY, cl, ha="right", va="center", fontsize=8.5, color="black", fontweight="bold")
+        ax.text(-3.5, midY, cl, ha="right", va="center", fontsize=8.5, color="black", fontweight="bold")
 
     ax.set_xlabel("")
     ax.set_ylabel("")
+    drawPitchTemplate(ax, pitchLengthM, pitchWidthM)
     ax.set_title("zone occupancy breakdown  (5 channels x 3 thirds)")
     plt.tight_layout()
     plt.savefig(str(outPath), dpi=120)
