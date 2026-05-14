@@ -7,7 +7,7 @@ S2  assign_teams(frame, entries, cfg) → {track_id: "home"|"away"|"gk"}
 Design goals
 ------------
 * Works when BOTH teams wear green (no hard-coded colour exclusion).
-* Handles tiny bboxes (as small as 22×57 px in the Leipzig dataset).
+* Handles tiny bboxes (as small as 22x57 px in the Leipzig dataset).
 * Handles partial occlusion, edge-of-frame players, and blurry crops.
 * Separates referee / GK outliers from the two main clusters.
 * Produces stable labels across a sequence via centroid anchoring.
@@ -48,14 +48,19 @@ Usage (script mode)
 
 from __future__ import annotations
 
-import argparse
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
 import cv2
 import numpy as np
+
+try:
+    import config
+    _DATASET_ROOT = config.datasetRoot / config.testSplit
+except ImportError:
+    config = None
+    _DATASET_ROOT = Path(r"C:\Users\Zain Ul Ibad\Desktop\projects\cv_project\sportsmot_publish\dataset\train")
 
 # ══════════════════════════════════════════════════════════════════════
 # Configuration
@@ -85,6 +90,11 @@ class FeatureConfig:
     val_bins: int = 4           # coarse brightness (dark/mid/bright/very bright)
     # Final feature dim = hue_bins + sat_bins + val_bins = 24 by default
 
+    # Saturation threshold for hue histogram masking — pixels below this
+    # are treated as achromatic (white/grey/black) and excluded from the
+    # hue distribution since their hue values are noise.
+    chromatic_sat_min: int = 30
+
     # ── Outlier detection (referee / GK) ──────────────────────────────
     # A track is tagged "gk" if its distance to BOTH team centroids
     # exceeds this fraction of the centroid-to-centroid distance.
@@ -95,6 +105,7 @@ class FeatureConfig:
 
     # ── K-means ───────────────────────────────────────────────────────
     kmeans_attempts:  int = 15
+    kmeans_k_initial: int = 6
     kmeans_max_iter:  int = 60
     kmeans_epsilon:   float = 0.5
 
@@ -102,7 +113,7 @@ class FeatureConfig:
     # Once centroids are computed for the first "anchor" frame batch,
     # subsequent frames use them as warm-start seeds (prevents cluster
     # flip between frames).
-    anchor_frames: int = 5     # number of frames pooled for initial centroids
+    anchor_frames: int = 10     # number of frames pooled for initial centroids
 
     # ── Minimum tracks needed to run K-means ──────────────────────────
     min_tracks_for_kmeans: int = 4
@@ -116,11 +127,23 @@ class FeatureConfig:
 # S1 — Jersey crop pipeline
 # ══════════════════════════════════════════════════════════════════════
 
-def _band_variance(patch: np.ndarray) -> float:
-    """Mean per-channel brightness variance — lower = more uniform fabric."""
+def _band_score(patch: np.ndarray) -> float:
+    """
+    Score a candidate jersey band — lower = better.
+
+    Combines BGR uniformity (low variance is good — uniform fabric) with
+    saturation (high is good — chromatic jersey beats white shorts).
+    A plain white shorts patch has low BGR variance but also low
+    saturation, so its score is penalised to keep numbered jerseys ahead
+    of solid-colour shorts.
+    """
     if patch.size == 0:
         return 1e9
-    return float(np.mean(np.var(patch.reshape(-1, 3).astype(np.float32), axis=0)))
+    bgr_var = float(np.mean(np.var(patch.reshape(-1, 3).astype(np.float32), axis=0)))
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    mean_sat = float(hsv[:, :, 1].mean())
+    # divide by (1 + sat/30): boosts saturated bands, demotes washed-out ones
+    return bgr_var / (1.0 + mean_sat / 30.0)
 
 
 def crop_jersey(
@@ -134,9 +157,10 @@ def crop_jersey(
     Strategy
     --------
     1. Try each band_candidate window (different vertical fractions).
-    2. Score each candidate by brightness variance (uniform fabric = low).
-    3. Return the lowest-variance crop — effectively auto-selects the
-       band that contains the most fabric-like pixels.
+    2. Score each candidate by chromatic uniformity (BGR variance
+       penalised by low saturation, so white shorts don't beat a
+       numbered jersey).
+    3. Return the lowest-score crop.
     4. If all candidates are degenerate (< min_crop_px), return a 1×1
        grey fallback so downstream code never crashes.
 
@@ -168,7 +192,7 @@ def crop_jersey(
         ex = x2;  sx = x
 
     best_crop: Optional[np.ndarray] = None
-    best_var = 1e9
+    best_score = 1e9
 
     for (top_f, bot_f) in cfg.band_candidates:
         sy = y + int(bh * top_f)
@@ -182,10 +206,10 @@ def crop_jersey(
         if area < cfg.min_crop_px:
             continue
 
-        var = _band_variance(patch)
-        if var < best_var:
-            best_var  = var
-            best_crop = patch
+        score = _band_score(patch)
+        if score < best_score:
+            best_score = score
+            best_crop  = patch
 
     if best_crop is None or best_crop.size == 0:
         return np.full((1, 1, 3), 128, dtype=np.uint8)
@@ -212,6 +236,11 @@ def _describe(crop: np.ndarray, cfg: FeatureConfig) -> Optional[np.ndarray]:
       Instead we use all pixels equally — the clustering separates teams by
       *relative* difference, which still works even if both are greenish.
 
+    The hue histogram is computed only over chromatic pixels (saturation
+    above cfg.chromatic_sat_min). Achromatic pixels (white/grey/black) have
+    noisy hue values that pollute the histogram. The saturation and value
+    histograms still see all pixels so achromatic information is preserved.
+
     Returns None if the crop is too small to be reliable.
     """
     area = crop.shape[0] * crop.shape[1]
@@ -220,9 +249,11 @@ def _describe(crop: np.ndarray, cfg: FeatureConfig) -> Optional[np.ndarray]:
 
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
 
-    h_hist = cv2.calcHist([hsv], [0], None, [cfg.hue_bins],  [0, 180]).flatten()
-    s_hist = cv2.calcHist([hsv], [1], None, [cfg.sat_bins],  [0, 256]).flatten()
-    v_hist = cv2.calcHist([hsv], [2], None, [cfg.val_bins],  [0, 256]).flatten()
+    sat_mask = (hsv[:, :, 1] >= cfg.chromatic_sat_min).astype(np.uint8) * 255
+
+    h_hist = cv2.calcHist([hsv], [0], sat_mask, [cfg.hue_bins], [0, 180]).flatten()
+    s_hist = cv2.calcHist([hsv], [1], None,     [cfg.sat_bins], [0, 256]).flatten()
+    v_hist = cv2.calcHist([hsv], [2], None,     [cfg.val_bins], [0, 256]).flatten()
 
     feat = np.concatenate([h_hist, s_hist, v_hist]).astype(np.float32)
     total = feat.sum()
@@ -267,9 +298,48 @@ def _kmeans_robust(
             features, 2, init_labels, criteria, 1, flags
         )
     else:
-        _, labels, centroids = cv2.kmeans(
-            features, 2, None, criteria,
+        # Over-cluster into k_initial micro-clusters first to give K-means
+        # room to separate visually-similar kits (e.g. white vs yellow-with-
+        # white-stripes). We then pick the two micro-clusters that are
+        # most colour-different from each other (not the two largest), so
+        # the team seeds maximise inter-team distance.
+        k_init = min(cfg.kmeans_k_initial, len(features))
+        _, micro_labels, micro_centroids = cv2.kmeans(
+            features, k_init, None, criteria,
             cfg.kmeans_attempts, cv2.KMEANS_PP_CENTERS
+        )
+        micro_labels = micro_labels.flatten()
+
+        # Find the pair of micro-centroids with maximum L2 distance — these
+        # are the two most colour-distinct clusters and become our seeds.
+        # Each must also have at least a few members so we don't pick a
+        # tiny outlier cluster like a single referee crop.
+        micro_sizes = np.array([int(np.sum(micro_labels == k)) for k in range(k_init)])
+        min_size = max(2, int(0.05 * len(features)))
+        valid_idx = [k for k in range(k_init) if micro_sizes[k] >= min_size]
+        if len(valid_idx) < 2:
+            valid_idx = list(range(k_init))
+
+        best_pair = (valid_idx[0], valid_idx[1])
+        best_dist = -1.0
+        for i in valid_idx:
+            for j in valid_idx:
+                if i >= j:
+                    continue
+                d = float(np.linalg.norm(micro_centroids[i] - micro_centroids[j]))
+                if d > best_dist:
+                    best_dist = d
+                    best_pair = (i, j)
+
+        seed_centroids = np.stack([micro_centroids[best_pair[0]],
+                                    micro_centroids[best_pair[1]]])
+
+        # Re-cluster everything into exactly 2 using the seeds as warm-start
+        d0 = np.linalg.norm(features - seed_centroids[0], axis=1)
+        d1 = np.linalg.norm(features - seed_centroids[1], axis=1)
+        init_labels = (d1 < d0).astype(np.int32).reshape(-1, 1)
+        _, labels, centroids = cv2.kmeans(
+            features, 2, init_labels, criteria, 1, cv2.KMEANS_USE_INITIAL_LABELS
         )
 
     labels = labels.flatten().astype(int)       # (N,)
@@ -302,30 +372,32 @@ def _resolve_labels(
     track_ids: List[int],
     labels:    np.ndarray,           # (N,) with 0/1/2
     centroids: np.ndarray,           # (2, D)
-    prev_centroids: Optional[np.ndarray],  # from last frame — prevents flip
+    anchor_centroids: Optional[np.ndarray],  # frozen original anchor — prevents flip
 ) -> Dict[int, str]:
     """
     Map cluster indices 0/1/2 to "home"/"away"/"gk".
 
     Flip prevention
     ---------------
-    If anchored centroids exist from prior frames, we compare the current
-    centroids to them.  If cluster-0 is closer to the prior cluster-1
-    centroid, we flip.  This keeps "home" and "away" stable across all
-    frames even when K-means flips its internal numbering.
+    If anchored centroids exist from the original sequence anchor, we
+    compare the current centroids to them.  If cluster-0 is closer to the
+    anchor cluster-1 centroid, we flip.  Using the FROZEN anchor (not the
+    previous frame) prevents gradual drift over long sequences — even if
+    lighting slowly shifts both centroids, the home/away identity stays
+    pinned to the original anchor reference.
     """
     result: Dict[int, str] = {}
 
     # Default mapping: 0→home, 1→away
     swap = False
-    if prev_centroids is not None:
+    if anchor_centroids is not None:
         d_same = (
-            np.linalg.norm(centroids[0] - prev_centroids[0]) +
-            np.linalg.norm(centroids[1] - prev_centroids[1])
+            np.linalg.norm(centroids[0] - anchor_centroids[0]) +
+            np.linalg.norm(centroids[1] - anchor_centroids[1])
         )
         d_swap = (
-            np.linalg.norm(centroids[0] - prev_centroids[1]) +
-            np.linalg.norm(centroids[1] - prev_centroids[0])
+            np.linalg.norm(centroids[0] - anchor_centroids[1]) +
+            np.linalg.norm(centroids[1] - anchor_centroids[0])
         )
         swap = d_swap < d_same
 
@@ -348,18 +420,23 @@ def assign_teams(
     entries: List[Tuple[int, Tuple[int, int, int, int]]],
     cfg:     FeatureConfig = FeatureConfig(),
     init_centroids: Optional[np.ndarray] = None,
+    anchor_centroids: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[int, str], Optional[np.ndarray]]:
     """
     Assign every tracked player to home / away / gk for one frame.
 
     Parameters
     ----------
-    frame          : BGR full frame
-    entries        : [(track_id, (x, y, w, h)), ...]
-    cfg            : FeatureConfig
-    init_centroids : (2, D) float32 — anchored centroids from earlier frames.
-                     Pass None for the first batch; pass returned centroids
-                     for subsequent frames.
+    frame            : BGR full frame
+    entries          : [(track_id, (x, y, w, h)), ...]
+    cfg              : FeatureConfig
+    init_centroids   : (2, D) float32 — rolling warm-start seed for K-means.
+                       Pass None for the first batch; pass returned centroids
+                       for subsequent frames.
+    anchor_centroids : (2, D) float32 — FROZEN anchor reference used only for
+                       flip prevention. Should be set once from the initial
+                       anchor and never updated. If None, falls back to
+                       init_centroids (legacy behaviour).
 
     Returns
     -------
@@ -391,7 +468,11 @@ def assign_teams(
 
     feat_matrix = np.stack(valid_feats)   # (N, D)
     labels, centroids, _ = _kmeans_robust(feat_matrix, cfg, init_centroids)
-    label_dict = _resolve_labels(valid_ids, labels, centroids, init_centroids)
+
+    # Use the frozen anchor for flip detection if available, otherwise
+    # fall back to init_centroids (preserves backward compatibility).
+    flip_reference = anchor_centroids if anchor_centroids is not None else init_centroids
+    label_dict = _resolve_labels(valid_ids, labels, centroids, flip_reference)
 
     # Invalid (too-small bbox) tracks marked gk
     for tid in invalid_ids:
@@ -406,12 +487,12 @@ def assign_teams(
 
 def majority_vote_labels(
     all_labels: Dict[int, Dict[int, str]],
-) -> Dict[int, str]:
+) -> Tuple[Dict[int, str], List[str]]:
     """
     Compute a stable, per-track final label by majority vote across all frames.
 
     gk is treated as uncertainty, not a real identity.  A track needs
-    more than 5% of its visible frames labelled home/away before it is
+    more than 30% of its visible frames labelled home/away before it is
     rescued from gk.  gk only wins if the track was never
     confidently assigned a team label across the whole sequence.
     """
@@ -448,8 +529,16 @@ def majority_vote_labels(
 
 def apply_majority_vote(
     all_labels: Dict[int, Dict[int, str]],
-) -> Dict[int, Dict[int, str]]:
-    """Replace every per-frame label with the sequence-level majority-vote label."""
+) -> Tuple[Dict[int, Dict[int, str]], Dict[int, str], List[str]]:
+    """
+    Replace every per-frame label with the sequence-level majority-vote label.
+
+    Returns
+    -------
+    stabilised       : per-frame labels with all frames sharing one stable label per track
+    final_per_track  : {track_id: final_label} for the whole sequence
+    rescue_log       : list of rescue messages
+    """
     final_per_track, rescue_log = majority_vote_labels(all_labels)
     stabilised: Dict[int, Dict[int, str]] = {}
     for fi, frame_labels in all_labels.items():
@@ -457,7 +546,7 @@ def apply_majority_vote(
             tid: final_per_track.get(tid, lbl)
             for tid, lbl in frame_labels.items()
         }
-    return stabilised
+    return stabilised, final_per_track, rescue_log
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -477,6 +566,7 @@ def run_sequence(
     """
     all_labels: Dict[int, Dict[int, str]] = {}
     anchored_centroids: Optional[np.ndarray] = None
+    original_anchor:    Optional[np.ndarray] = None
     anchor_feats: List[np.ndarray] = []
     anchor_collected = 0
 
@@ -507,14 +597,65 @@ def run_sequence(
             if anchor_collected == cfg.anchor_frames and len(anchor_feats) >= cfg.min_tracks_for_kmeans:
                 feat_matrix = np.stack(anchor_feats)
                 _, anchored_centroids, _ = _kmeans_robust(feat_matrix, cfg)
+                original_anchor = anchored_centroids.copy()   # freeze for flip detection
 
         labels, anchored_centroids = assign_teams(
-            frame, entries, cfg, anchored_centroids
+            frame, entries, cfg, anchored_centroids,
+            anchor_centroids=original_anchor,
         )
         all_labels[frame_idx] = labels
 
-    all_labels = apply_majority_vote(all_labels)
+    all_labels, _, _ = apply_majority_vote(all_labels)
     return all_labels
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Pipeline adapter — TeamAssigner class
+# ══════════════════════════════════════════════════════════════════════
+
+class TeamAssigner:
+    """
+    Stateful adapter so pipeline.py can call team assignment frame-by-frame
+    without managing centroid state manually.
+
+    Accepts tracks in Zain's pipeline format (list of dicts with 'trackId'
+    and 'bbox' keys) and returns {trackId: 'home'|'away'|'gk'}.
+
+    Usage
+    -----
+        assigner = TeamAssigner()
+        for frame, tracks in stream:
+            labels = assigner.assign(frame, tracks)
+    """
+    def __init__(self, cfg: Optional[FeatureConfig] = None):
+        self.cfg = cfg if cfg is not None else FeatureConfig()
+        self.anchored_centroids: Optional[np.ndarray] = None
+        self.original_anchor:    Optional[np.ndarray] = None
+
+    def reset(self):
+        """Clear centroid state — call when starting a new sequence."""
+        self.anchored_centroids = None
+        self.original_anchor    = None
+
+    def assign(self, frame: np.ndarray, tracks: List[Dict]) -> Dict[int, str]:
+        """
+        Assign teams for one frame.
+
+        Parameters
+        ----------
+        frame  : BGR full frame
+        tracks : list of dicts with 'trackId' and 'bbox' keys
+                 (bbox is (x, y, w, h))
+        """
+        entries = [(int(t["trackId"]), t["bbox"]) for t in tracks]
+        labels, self.anchored_centroids = assign_teams(
+            frame, entries, self.cfg, self.anchored_centroids,
+            anchor_centroids=self.original_anchor,
+        )
+        # Freeze the very first valid centroids as the anchor reference.
+        if self.original_anchor is None and self.anchored_centroids is not None:
+            self.original_anchor = self.anchored_centroids.copy()
+        return labels
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -682,14 +823,17 @@ def run_feature8(
                       is not given (default 50).
     """
     here        = Path(__file__).parent
-    videos_root = here / "videos"
-    # output sits at the same level as videos/, not inside it
+    # Dataset root comes from config.py so the path stays consistent with
+    # the rest of the pipeline. Sequences are searched under config.testSplit
+    # by default — update config.testSplit (e.g. to "train") if running on
+    # other splits.
+    videos_root = _DATASET_ROOT
     out_root    = here / "output" / "feature_8"
 
     if not videos_root.is_dir():
         raise FileNotFoundError(
-            f"videos/ folder not found at {videos_root}\n"
-            "Place this script next to the videos/ directory."
+            f"dataset folder not found at {videos_root}\n"
+            f"check config.datasetRoot and config.testSplit"
         )
 
     seq_dirs = sorted(d for d in videos_root.iterdir() if d.is_dir())
@@ -745,6 +889,7 @@ def run_feature8(
         # ── Anchor phase: pool first cfg.anchor_frames for stable centroids
         anchor_feats: List[np.ndarray] = []
         anchored_centroids: Optional[np.ndarray] = None
+        original_anchor:    Optional[np.ndarray] = None
         frames_for_anchor = frame_indices[: cfg.anchor_frames]
 
         for fi in frames_for_anchor:
@@ -763,6 +908,7 @@ def run_feature8(
             _, anchored_centroids, _ = _kmeans_robust(
                 np.stack(anchor_feats), cfg
             )
+            original_anchor = anchored_centroids.copy()   # freeze for flip detection
             print(f"[{seq_dir.name}] anchor built from "
                   f"{len(anchor_feats)} crops "
                   f"({len(frames_for_anchor)} anchor frame(s))")
@@ -791,14 +937,14 @@ def run_feature8(
                 continue
 
             labels, anchored_centroids = assign_teams(
-                frame, entries, cfg, anchored_centroids
+                frame, entries, cfg, anchored_centroids,
+                anchor_centroids=original_anchor,
             )
             raw_labels[fi]    = labels
             frame_entries[fi] = entries
 
         # ── Majority-vote stabilisation ───────────────────────────────
-        stable_labels = apply_majority_vote(raw_labels)
-        voted, rescue_log = majority_vote_labels(raw_labels)
+        stable_labels, voted, rescue_log = apply_majority_vote(raw_labels)
 
         log_path = seq_out / "gk_rescue_log.txt"
         with open(log_path, "w") as f:
@@ -862,38 +1008,14 @@ def run_feature8(
 # CLI
 # ══════════════════════════════════════════════════════════════════════
 
-#if __name__ == "__main__":
-#
-#    here        = Path(__file__).parent
-#    videos_root = here / "videos"
-#
-#    for seq_dir in sorted(videos_root.iterdir()):
-#        if not seq_dir.is_dir():
-#            continue
-#
-#        all_frame_paths = _collect_frame_paths(str(seq_dir / "img1"))
-#        all_frame_indices = sorted(
-#            _frame_index_of(p)
-#            for p in all_frame_paths
-#            if _frame_index_of(p) >= 0
-#        )
-#
-#        print(f"Processing {len(all_frame_indices)} frames from {seq_dir.name}")
-#
-#        run_feature8(
-#            seq_filter=seq_dir.name,
-#            explicit_frames=all_frame_indices,
-#        )
-#
-
-
 if __name__ == "__main__":
 
     # ── DEFINE WHICH SEQUENCE TO RUN ──────────────────────────────────
     SEQ_NAME = "v_HdiyOtliFiw_c003"  # ← CHANGE THIS to your sequence name
     
-    here = Path(__file__).parent
-    videos_root = here / "videos"
+    # Dataset root comes from config.py — update config.testSplit if you
+    # need to run on a different split (e.g. "train").
+    videos_root = config.datasetRoot / "train" if config is not None else Path(r"C:\Users\Zain Ul Ibad\Desktop\projects\cv_project\sportsmot_publish\dataset\train")
     
     # Process ONLY the specified sequence
     seq_dir = videos_root / SEQ_NAME
@@ -915,9 +1037,3 @@ if __name__ == "__main__":
         seq_filter=seq_dir.name,
         explicit_frames=all_frame_indices,
     )
-
-        
-        
-        
-
-
