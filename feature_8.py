@@ -37,18 +37,22 @@ Folder layout expected
         <seq_name>/
           crops_frame_001.jpg
           overlay_frame_001.jpg
+          team_labels.json    ← structured team labels for Feature 10
           …
 
 Usage (script mode)
 -------------------
-    python feature_8.py                        # all sequences, first 50 frames
+    python feature_8.py                              # all sequences, first 50 frames
     python feature_8.py --seq v_HdiyOtliFiw_c003
-    python feature_8.py --seq v_HdiyOtliFiw_c003 --frames 155 200
+    python feature_8.py --seq v_HdiyOtliFiw_c003 --frames 100
+    python feature_8.py --seq v_HdiyOtliFiw_c003 --frames 50 100
 """
 
 from __future__ import annotations
 
+import json
 import os
+import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -60,7 +64,7 @@ try:
     _DATASET_ROOT = config.datasetRoot / config.testSplit
 except ImportError:
     config = None
-    _DATASET_ROOT = Path(r"C:\Users\Zain Ul Ibad\Desktop\projects\cv_project\sportsmot_publish\dataset\train")
+    _DATASET_ROOT = Path(r"C:\Users\samee\Documents\Computer Vision\project\videos")
 
 # ══════════════════════════════════════════════════════════════════════
 # Configuration
@@ -813,6 +817,12 @@ def run_feature8(
           overlays/
             overlay_frame_001.jpg  ← full frame with coloured bboxes (S2 labels)
             …
+          jersey_crops/            ← individual jersey crops per team
+            home/
+            away/
+            gk/
+          team_labels.json         ← structured team labels for Feature 10
+          gk_rescue_log.txt
 
     Parameters
     ----------
@@ -957,9 +967,23 @@ def run_feature8(
                 f.write("No tracks were rescued from gk.\n")
         print(f"[{seq_dir.name}] rescue log → {log_path}")
 
-
         print(f"[{seq_dir.name}] majority-vote final assignments: "
               + ", ".join(f"#{tid}->{lbl}" for tid, lbl in sorted(voted.items())))
+
+        # ── Save team labels JSON for Feature 10 ─────────────────────
+        team_labels_json = {
+            "sequence": seq_dir.name,
+            "home_track_ids": [tid for tid, lbl in voted.items() if lbl == "home"],
+            "away_track_ids": [tid for tid, lbl in voted.items() if lbl == "away"],
+            "gk_track_ids": [tid for tid, lbl in voted.items() if lbl == "gk"],
+            "per_frame": {str(fi): labels for fi, labels in stable_labels.items()},
+            "final_per_track": {str(tid): lbl for tid, lbl in voted.items()}
+        }
+        
+        json_path = seq_out / "team_labels.json"
+        with open(json_path, "w") as f:
+            json.dump(team_labels_json, f, indent=2)
+        print(f"[{seq_dir.name}] team labels JSON → {json_path}")
 
         # ── Pass 2: write visualisation images using stable labels ────
         for fi, entries in sorted(frame_entries.items()):
@@ -990,7 +1014,6 @@ def run_feature8(
                 team_dir.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(team_dir / f"frame_{fi:03d}_track_{tid}.jpg"), jersey)
 
-
             counts: Dict[str, int] = {}
             for v in labels.values():
                 counts[v] = counts.get(v, 0) + 1
@@ -1010,12 +1033,19 @@ def run_feature8(
 
 if __name__ == "__main__":
 
-    # ── DEFINE WHICH SEQUENCE TO RUN ──────────────────────────────────
-    SEQ_NAME = "v_HdiyOtliFiw_c003"  # ← CHANGE THIS to your sequence name
+    parser = argparse.ArgumentParser(description="Feature 8 - Team Assignment")
+    parser.add_argument("--seq", type=str, default="v_2QhNRucNC7E_c017",
+                        help="Sequence folder name inside videos/")
+    parser.add_argument("--frames", type=int, default=None,
+                        help="Number of frames to process (default: all frames)")
+    
+    args = parser.parse_args()
+    
+    SEQ_NAME = args.seq
     
     # Dataset root comes from config.py — update config.testSplit if you
     # need to run on a different split (e.g. "train").
-    videos_root = config.datasetRoot / "train" if config is not None else Path(r"C:\Users\Zain Ul Ibad\Desktop\projects\cv_project\sportsmot_publish\dataset\train")
+    videos_root = config.datasetRoot / "train" if config is not None else Path(r"C:\Users\samee\Documents\Computer Vision\project\videos")
     
     # Process ONLY the specified sequence
     seq_dir = videos_root / SEQ_NAME
@@ -1031,7 +1061,12 @@ if __name__ == "__main__":
         if _frame_index_of(p) >= 0
     )
     
-    print(f"Processing {len(all_frame_indices)} frames from {seq_dir.name}")
+    # Limit frames if specified
+    if args.frames:
+        all_frame_indices = all_frame_indices[:args.frames]
+        print(f"Processing {len(all_frame_indices)} frames (first {args.frames}) from {seq_dir.name}")
+    else:
+        print(f"Processing all {len(all_frame_indices)} frames from {seq_dir.name}")
     
     run_feature8(
         seq_filter=seq_dir.name,
