@@ -25,7 +25,6 @@ Usage
 """
 
 from __future__ import annotations
-
 import argparse
 import csv
 import time
@@ -33,16 +32,15 @@ from collections import defaultdict
 from configparser import ConfigParser
 from pathlib import Path
 from typing import Optional
-
+import config
 import cv2
 import numpy as np
-
 from ball_detect import BallDetector
 from homography import PitchHomography
 from touch_assigner import MultiPlayerTouchAssigner, PlayerBox, TouchEvent
 
 
-DATASET_TRAIN_DIR = Path("dataset/train")
+DATASET_TRAIN_DIR = config.datasetRoot / config.testSplit
 HOMOGRAPHY_DIR    = Path("homographies")
 TOUCHES_OUT_DIR   = Path("touches")
 

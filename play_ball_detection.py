@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import time
+import config
 from collections import defaultdict, deque
 from configparser import ConfigParser
 from pathlib import Path
@@ -44,7 +45,7 @@ from pitch_config import world_xy_to_zone
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-DATASET_TRAIN_DIR = Path("dataset/train")
+DATASET_TRAIN_DIR = config.datasetRoot / config.testSplit
 HOMOGRAPHY_DIR    = Path("homographies")
 WINDOW_NAME       = "Ball Detection - Live"
 FPS_WINDOW        = 30          # frames over which to compute rolling FPS
