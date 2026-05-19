@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
@@ -6,6 +8,8 @@ import config
 import dataLoader
 import opticalFlow
 import movement
+import detection
+import tracking
 from homography import PitchHomography
 
 
@@ -15,12 +19,8 @@ def buildHeatmap(worldPositions, pitchLengthM, pitchWidthM, resolution, sigma):
     heatmap = np.zeros((gridH, gridW), dtype=np.float32)
 
     for x, y in worldPositions:
-        gx = int(x * resolution)
-        gy = int(y * resolution)
-        if(gx < 0 or gx >= gridW):
-            continue
-        if(gy < 0 or gy >= gridH):
-            continue
+        gx = min(max(int(x * resolution), 0), gridW - 1)
+        gy = min(max(int(y * resolution), 0), gridH - 1)
         heatmap[gy, gx] += 1.0
 
     if(heatmap.sum() == 0):
@@ -85,6 +85,7 @@ def drawPitchTemplate(ax, pitchLengthM, pitchWidthM):
     ax.add_patch(plt.Rectangle((0, (pitchWidthM - 18.32) / 2), 5.5, 18.32, color="white", fill=False, linewidth=1.2))
     ax.add_patch(plt.Rectangle((pitchLengthM - 5.5, (pitchWidthM - 18.32) / 2), 5.5, 18.32, color="white", fill=False, linewidth=1.2))
 
+
 def renderHeatmapImage(heatmap, pitchLengthM, pitchWidthM, outPath, title="player heatmap"):
     fig, ax = plt.subplots(figsize=(11, 7))
     drawPitchTemplate(ax, pitchLengthM, pitchWidthM)
@@ -143,59 +144,201 @@ def renderZoneBreakdown(zoneStats, pitchLengthM, pitchWidthM, outPath):
     plt.close()
 
 
-if(__name__ == "__main__"):
-    print("running heatmap self-check on test sequence")
-    seqPath = config.testSequencePath
-    info = dataLoader.readSeqInfo(seqPath)
-    gt = dataLoader.readGroundTruth(seqPath)
-    frameRate = info["frameRate"]
-    print(f"sequence {info['name']}, {info['seqLength']} frames at {frameRate} fps")
-    homoPath = config.projectRoot / "homographies" / f"{info['name']}.npz"
-    if(not homoPath.exists()):
-        print(f"  homography file not found at {homoPath}")
-        exit(1)
+def videoFrameRate(videoPath):
+    """reads the frame rate from a video file, falls back to the config default"""
+    cap = cv2.VideoCapture(str(videoPath))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    if(fps <= 0):
+        return float(config.frameRate)
+    return float(fps)
 
+
+def iterateFrames(inputPath, isVideo):
+    """yields (frameId, frame) from either a sportsmot sequence folder or a video file"""
+    if(isVideo):
+        cap = cv2.VideoCapture(str(inputPath))
+        frameId = 1
+        while(True):
+            ret, frame = cap.read()
+            if(not ret):
+                break
+            if(frameId % 2  == 0):
+                yield frameId, frame
+            frameId += 1
+        cap.release()
+    else:
+        for data in dataLoader.loadSequence(inputPath):
+            yield data["frameId"], data["frame"]
+
+
+def isOnPitch(bbox, cameraMotion, homography, pitchLengthM, pitchWidthM, marginM):
+    """returns True if a detection projects to within the pitch bounds plus a margin"""
+    footPx = movement.footPoint(bbox)
+    compensated = movement.compensateCameraMotion(footPx, cameraMotion)
+    worldX, worldY = movement.pixelToWorld(compensated, homography)
+    if(worldX < -marginM or worldX > pitchLengthM + marginM):
+        return False
+    if(worldY < -marginM or worldY > pitchWidthM + marginM):
+        return False
+    return True
+
+
+def saveAnnotatedFrame(frame, tracks, outPath):
+    """draws track ids on a frame and saves it as a visual reference for picking a player"""
+    annotated = frame.copy()
+    for trackId, x, y, w, h in tracks:
+        cv2.rectangle(annotated, (int(x), int(y)), (int(x + w), int(y + h)), (0, 255, 0), 2)
+        cv2.putText(annotated, f"id {trackId}", (int(x), int(y) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+    cv2.imwrite(str(outPath), annotated)
+
+
+if(__name__ == "__main__"):
+    # a player needs at least 2 seconds of visibility for a meaningful heatmap (50 frames at 25 fps)
+    minVisibleFrames = 50
+    # tolerance beyond the pitch line, absorbs homography error and keeps genuine touchline players
+    pitchMarginM = 3.0
+
+    if(len(sys.argv) < 2):
+        print("usage: python heatmap.py <inputPath> [homographyPath]")
+        print("  inputPath can be a sportsmot sequence folder or a staticCam video file")
+        print("  homographyPath is required for video input, optional for sportsmot")
+        sys.exit(1)
+
+    inputPath = Path(sys.argv[1])
+    homographyArg = Path(sys.argv[2]) if(len(sys.argv) >= 3) else None
+
+    if(not inputPath.exists()):
+        print(f"input path does not exist {inputPath}")
+        sys.exit(1)
+
+    isVideo = inputPath.is_file()
+
+    if(isVideo):
+        seqName = inputPath.stem
+        frameRate = videoFrameRate(inputPath)
+        useGtMode = False
+        print(f"staticCam video input {inputPath.name}, {frameRate:.0f} fps")
+        if(homographyArg is None):
+            print("homography path is required for video input, pass it as the second argument")
+            sys.exit(1)
+        homoPath = homographyArg
+    else:
+        info = dataLoader.readSeqInfo(inputPath)
+        seqName = info["name"]
+        frameRate = info["frameRate"]
+        useGtMode = config.useGt
+        print(f"sportsmot sequence {seqName}, {info['seqLength']} frames at {frameRate} fps")
+        if(homographyArg is not None):
+            homoPath = homographyArg
+        else:
+            homoPath = config.projectRoot / "homographies" / f"{seqName}.npz"
+
+    if(not homoPath.exists()):
+        print(f"homography file not found at {homoPath}")
+        sys.exit(1)
     homo = PitchHomography.load(str(homoPath))
-    print(f"  loaded homography from {homoPath.name}")
-    if(1 not in gt or len(gt[1]) == 0):
-        print("  no gt boxes in frame 1")
-        exit(1)
-    targetId = gt[1][0][0]
-    print(f"  target player set to track id {targetId}")
-    numFrames = min(500, info["seqLength"])
-    print(f"loading {numFrames} frames for heatmap analysis")
-    frames = []
+    print(f"loaded homography from {homoPath.name}")
+
+    model = None
+    if(not useGtMode):
+        print("loading yolo model for detection and tracking")
+        model = detection.loadModel()
+
+    gt = {}
+    if(not isVideo and useGtMode):
+        gt = dataLoader.readGroundTruth(inputPath)
+
+    print("pass 1, collecting tracks and camera motion across all frames")
+    allTracks = []
+    cameraMotions = []
+    prevFrame = None
+    cumX, cumY = 0.0, 0.0
+    firstFrameDone = False
+    rawCount = 0
+    keptCount = 0
+
+    annotatedDir = config.outputsDir / "annotatedFrames"
+    annotatedDir.mkdir(parents=True, exist_ok=True)
+
+    for frameId, frame in iterateFrames(inputPath, isVideo):
+        if(useGtMode):
+            rawTracks = list(gt.get(frameId, []))
+        else:
+            yoloTracks = tracking.trackYolo(frame, model)
+            rawTracks = [(t["trackId"], t["bbox"][0], t["bbox"][1], t["bbox"][2], t["bbox"][3]) for t in yoloTracks]
+
+        if(isVideo):
+            motion = (0.0, 0.0)
+        else:
+            if(prevFrame is None):
+                motion = (0.0, 0.0)
+            else:
+                maskBoxes = [(x, y, w, h) for _, x, y, w, h in rawTracks]
+                (dx, dy), _, _ = opticalFlow.computeCameraMotion(prevFrame, frame, maskBoxes)
+                cumX += dx
+                cumY += dy
+                motion = (cumX, cumY)
+            prevFrame = frame
+        cameraMotions.append(motion)
+
+        tracks = []
+        for trackId, x, y, w, h in rawTracks:
+            if(isOnPitch((x, y, w, h), motion, homo, config.pitchWidthM, config.pitchHeightM, pitchMarginM)):
+                tracks.append((trackId, x, y, w, h))
+        rawCount += len(rawTracks)
+        keptCount += len(tracks)
+        allTracks.append(tracks)
+        if(frameId % 100 == 0):
+            print(f"  processed frame {frameId}")
+
+        if(not firstFrameDone):
+            outFrame = annotatedDir / f"{seqName}_ids.jpg"
+            saveAnnotatedFrame(frame, tracks, outFrame)
+            print(f"saved annotated reference frame to {outFrame}")
+            firstFrameDone = True
+
+    print(f"processed {len(allTracks)} frames")
+    print(f"kept {keptCount} on-pitch detections, dropped {rawCount - keptCount} off-pitch detections")
+
+    idCounts = {}
+    for tracks in allTracks:
+        for trackId, x, y, w, h in tracks:
+            idCounts[trackId] = idCounts.get(trackId, 0) + 1
+
+    if(len(idCounts) == 0):
+        print("no on-pitch players found in this clip, nothing to generate")
+        sys.exit(1)
+
+    print("available player ids and how many frames each is visible for")
+    for trackId in sorted(idCounts.keys()):
+        print(f"  id {trackId}  visible in {idCounts[trackId]} frames")
+
+    chosen = int(input("enter the player id to generate a heatmap for: "))
+
+    if(chosen not in idCounts):
+        print(f"id {chosen} is not in this clip")
+        sys.exit(1)
+
+    if(idCounts[chosen] < minVisibleFrames):
+        print(f"id {chosen} is only visible for {idCounts[chosen]} frames, needs at least {minVisibleFrames}")
+        print("heatmap rejected, pick a player with more visibility")
+        sys.exit(1)
+
+    print(f"building heatmap for player {chosen}")
     targetPositions = []
-    for i, data in enumerate(dataLoader.loadSequence(seqPath)):
-        if(i >= numFrames):
-            break
-        frames.append(data["frame"])
+    for tracks in allTracks:
         found = None
-        for trackId, x, y, w, h in data["boxes"]:
-            if(trackId == targetId):
+        for trackId, x, y, w, h in tracks:
+            if(trackId == chosen):
                 found = (x, y, w, h)
                 break
         targetPositions.append(found)
 
-    framesPresent = sum(1 for p in targetPositions if p is not None)
-    print(f"target player visible in {framesPresent}/{numFrames} frames")
-    print("computing camera motion")
-    cameraMotions = [(0.0, 0.0)]
-    cumX, cumY = 0.0, 0.0
-    for i in range(1, len(frames)):
-        prevBoxes = []
-        if(i in gt):
-            prevBoxes = [(x, y, w, h) for _, x, y, w, h in gt[i]]
-        (dx, dy), _, _ = opticalFlow.computeCameraMotion(frames[i - 1], frames[i], prevBoxes)
-        cumX += dx
-        cumY += dy
-        cameraMotions.append((cumX, cumY))
-
-    print("getting world positions via movement.analysePlayer")
     result = movement.analysePlayer(targetPositions, cameraMotions, homo, frameRate)
     worldPositions = result["worldPositions"]
-    print(f"  got {len(worldPositions)} world positions")
-    print("building heatmap")
+    print(f"got {len(worldPositions)} world positions")
+
     heatmap = buildHeatmap(
         worldPositions,
         config.pitchWidthM,
@@ -203,17 +346,19 @@ if(__name__ == "__main__"):
         config.heatmapPitchResolution,
         config.heatmapGaussianSigma,
     )
-    print(f"  heatmap shape {heatmap.shape}, max intensity {heatmap.max():.3f}")
-    print("computing zone occupancy")
+    print(f"heatmap shape {heatmap.shape}, max intensity {heatmap.max():.3f}")
+
     zones = zoneOccupancy(worldPositions, config.pitchWidthM, config.pitchHeightM)
+    print("zone occupancy")
     for label, pct in zones.items():
         if(pct > 0.0):
             print(f"  {label:35s}  {pct:5.1f}%")
 
-    outImg = config.outputsDir / "heatmap_test.png"
-    renderHeatmapImage(heatmap, config.pitchWidthM, config.pitchHeightM, outImg, title=f"player {targetId} heatmap  -  {numFrames} frames")
+    outImg = config.outputsDir / f"heatmap_{seqName}_player{chosen}.png"
+    renderHeatmapImage(heatmap, config.pitchWidthM, config.pitchHeightM, outImg, title=f"player {chosen} heatmap  -  {seqName}")
     print(f"saved heatmap to {outImg}")
-    outZones = config.outputsDir / "zone_occupancy_test.png"
+
+    outZones = config.outputsDir / f"zone_{seqName}_player{chosen}.png"
     renderZoneBreakdown(zones, config.pitchWidthM, config.pitchHeightM, outZones)
     print(f"saved zone breakdown to {outZones}")
-    print("heatmap self-check done")
+    print("heatmap generation done")
