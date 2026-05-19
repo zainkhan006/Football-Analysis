@@ -18,18 +18,16 @@ Pipeline per frame:
        map to a formation string
 
 Run:
-    python feature_10.py
+    python feature_10.py staticCam/<video name>.mp4 homographies/napoli_roma_2.npz
 """
 
-import os
+import sys
 import cv2
 import numpy as np
 from pathlib import Path
 from collections import deque
 import config
-from dataLoader import loadSequence, readSeqInfo, readGroundTruth
-from detection import detect
-from tracking import trackYolo, trackFromGt
+from tracking import trackYolo
 from feature_8 import TeamAssigner
 from homography import PitchHomography
 from ultralytics import YOLO
@@ -42,6 +40,7 @@ from ultralytics import YOLO
 # Rolling window of frames over which the line counts are averaged.
 # 1s of footage at 25fps. Smaller = jumpy formations, larger = sluggish.
 formationSmoothingWindow = 50
+pitchMarginM = 3.0
 
 # K-means line counts to try. A team plays in 2-4 horizontal lines.
 # We pick the k whose within-cluster variance "elbow" gives the best fit.
@@ -382,9 +381,10 @@ def composeFrame(videoFrame, homeMini, awayMini):
 # Sequence runner with interactive playback
 # ══════════════════════════════════════════════════════════════════════
 
-def runFormationViewer(seqPath, homographyPath, useGt=True):
+def runFormationViewer(videoPath, homographyPath):
     """
-    Walk through the sequence frame-by-frame and render the formation view.
+    Walk through the staticCam video frame-by-frame and render the
+    formation view.
 
     Controls:
         SPACE   pause/play
@@ -392,25 +392,21 @@ def runFormationViewer(seqPath, homographyPath, useGt=True):
         P       previous frame (when paused)
         Q       quit
     """
-    info = readSeqInfo(seqPath)
-    seqLen = info["seqLength"]
-    print(f"loaded sequence {Path(seqPath).name} with {seqLen} frames")
+    cap = cv2.VideoCapture(str(videoPath))
+    if(not cap.isOpened()):
+        print(f"could not open video {videoPath}")
+        raise SystemExit(1)
+    seqLen = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"loaded video {Path(videoPath).name} with {seqLen} frames")
 
     homography = PitchHomography.load(homographyPath)
     print(f"loaded homography from {homographyPath}")
 
     assigner = TeamAssigner()
-
-    if(useGt):
-        gt = readGroundTruth(seqPath)
-        yoloModel = None
-    else:
-        yoloModel = YOLO(config.yoloWeightsPath)
-        gt = None
+    yoloModel = YOLO(config.yoloWeightsPath)
 
     # Pre-compute everything because seeking back/forward needs random access
-    framePaths = sorted((Path(seqPath) / "img1").glob("*.jpg"))
-    cachedDisplay = [None] * len(framePaths)
+    cachedDisplay = []
 
     homeSmoother = FormationSmoother(formationSmoothingWindow)
     awaySmoother = FormationSmoother(formationSmoothingWindow)
@@ -419,20 +415,20 @@ def runFormationViewer(seqPath, homographyPath, useGt=True):
 
     print("processing frames - this can take a minute on a long clip")
 
-    for frameIdx, framePath in enumerate(framePaths):
-        frame = cv2.imread(str(framePath))
-        if(frame is None):
-            continue
+    frameIdx = 0
+    while(True):
+        ret, frame = cap.read()
+        if(not ret):
+            break
+        if(frameIdx > 3000):
+            break
 
         # Get tracks for this frame
-        if(useGt):
-            gtBoxes = gt.get(frameIdx + 1, [])
-            tracks = trackFromGt(gtBoxes)
-        else:
-            tracks = trackYolo(frame, yoloModel)
+        tracks = trackYolo(frame, yoloModel)
 
         # Assign teams
         labels = assigner.assign(frame, tracks)
+        print(f"frame {frameIdx}  total tracks {len(tracks)}  home {sum(1 for v in labels.values() if v == 'home')}  away {sum(1 for v in labels.values() if v == 'away')}  gk {sum(1 for v in labels.values() if v == 'gk')}")
 
         # Build (trackId, footPxX, footPxY, worldX, worldY, team) per track
         homePlayersPx = []
@@ -446,6 +442,10 @@ def runFormationViewer(seqPath, homographyPath, useGt=True):
             footPxX = x + w / 2.0
             footPxY = y + h
             wx, wy = homography.pixel_to_world(footPxX, footPxY)
+            if(wx < -pitchMarginM or wx > config.pitchWidthM + pitchMarginM):
+                continue
+            if(wy < -pitchMarginM or wy > config.pitchHeightM + pitchMarginM):
+                continue
             team = labels.get(tid, "gk")
             if(team == "home"):
                 homePlayersPx.append((tid, footPxX, footPxY))
@@ -457,6 +457,7 @@ def runFormationViewer(seqPath, homographyPath, useGt=True):
         # Drop the GK from each team
         homeWorld = removeGoalkeeper(homeWorld)
         awayWorld = removeGoalkeeper(awayWorld)
+        print(f"frame {frameIdx}  on-pitch home {len(homeWorld)}  away {len(awayWorld)}")
         # Keep the pixel and world lists in sync after GK removal
         homeKeepIds = {p[0] for p in homeWorld}
         awayKeepIds = {p[0] for p in awayWorld}
@@ -508,10 +509,13 @@ def runFormationViewer(seqPath, homographyPath, useGt=True):
         awayMini = renderMinimap(awayWorldXY, awaySmoothed, awayColor,
                                  awayFormation, "AWAY")
 
-        cachedDisplay[frameIdx] = composeFrame(annotated, homeMini, awayMini)
+        cachedDisplay.append(composeFrame(annotated, homeMini, awayMini))
 
-        if((frameIdx + 1) % 50 == 0):
-            print(f"  processed frame {frameIdx + 1}/{len(framePaths)}")
+        frameIdx += 1
+        if(frameIdx % 50 == 0):
+            print(f"  processed frame {frameIdx}/{seqLen}")
+
+    cap.release()
 
     print("done processing - opening viewer")
     print("controls: SPACE play/pause | N next | P prev | Q quit")
@@ -548,16 +552,18 @@ def runFormationViewer(seqPath, homographyPath, useGt=True):
 # ══════════════════════════════════════════════════════════════════════
 
 if(__name__ == "__main__"):
-    seqName = "v_i2_L4qquVg0_c006"
-    seqPath = config.datasetRoot / config.testSplit / seqName
-    homographyPath = Path("homographies") / f"{seqName}.npz"
+    if(len(sys.argv) < 3):
+        print("usage: python feature_10.py <videoPath> <homographyPath>")
+        raise SystemExit(1)
 
-    if(not seqPath.is_dir()):
-        print(f"sequence folder not found at {seqPath}")
+    videoPath = Path(sys.argv[1])
+    homographyPath = Path(sys.argv[2])
+
+    if(not videoPath.is_file()):
+        print(f"video file not found at {videoPath}")
         raise SystemExit(1)
     if(not homographyPath.is_file()):
         print(f"homography file not found at {homographyPath}")
-        print(f"run compute_homographies.py --seq {seqName} first")
         raise SystemExit(1)
 
-    runFormationViewer(seqPath, homographyPath, useGt=config.useGt)
+    runFormationViewer(videoPath, homographyPath)

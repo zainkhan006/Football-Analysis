@@ -98,7 +98,7 @@ class FeatureConfig:
     # ── Outlier detection (referee / GK) ──────────────────────────────
     # A track is tagged "gk" if its distance to BOTH team centroids
     # exceeds this fraction of the centroid-to-centroid distance.
-    outlier_threshold: float = 0.50
+    outlier_threshold: float = 0.90
     # Suppress outlier flagging when either cluster has fewer than this many
     # members — prevents a lone attacker from being wrongly tagged gk.
     min_cluster_size_for_outlier: int = 2
@@ -361,6 +361,7 @@ def _kmeans_robust(
         labels[is_outlier] = 2
     # else: one cluster tiny → trust all assignments, flag nothing as outlier
 
+    print(f"valid feats {len(features)}  centroid dist {np.linalg.norm(centroids[0] - centroids[1]):.4f}")
     return labels, centroids, distances
 
 
@@ -460,6 +461,7 @@ def assign_teams(
             valid_feats.append(feat)
         else:
             invalid_ids.append(tid)
+        print(f"valid {len(valid_ids)}  invalid {len(invalid_ids)}")
 
     # Not enough usable tracks — assign everything to gk
     if len(valid_ids) < cfg.min_tracks_for_kmeans:
