@@ -5,6 +5,7 @@ import numpy as np
 import cv2
 import config
 
+
 def readSeqInfo(seqPath):
     iniPath = seqPath / "seqinfo.ini"
     parser = configparser.ConfigParser()
@@ -57,6 +58,38 @@ def loadSequence(seqPath):
             "frame": frame,
             "boxes": gt.get(frameId, []),
         }
+
+
+def loadVideo(videoPath):
+    """yields frame dicts from a video file. boxes will always be empty since videos have no gt."""
+    cap = cv2.VideoCapture(str(videoPath))
+    if(not cap.isOpened()):
+        print(f"could not open video at {videoPath}")
+        return
+
+    frameId = 1
+    while(True):
+        ret, frame = cap.read()
+        if(not ret):
+            break
+        yield {
+            "frameId": frameId,
+            "frame": frame,
+            "boxes": [],
+        }
+        frameId += 1
+
+    cap.release()
+
+
+def videoFrameRate(videoPath):
+    """reads the frame rate from a video file, falls back to the config default"""
+    cap = cv2.VideoCapture(str(videoPath))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    if(fps <= 0):
+        return float(config.frameRate)
+    return float(fps)
 
 
 if __name__ == "__main__":
