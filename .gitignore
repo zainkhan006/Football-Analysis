@@ -1,7 +1,10 @@
 sportsmot_publish/
 staticCam/
 homographies/
+weights/
 models/
+outputs/
+outputs/annotatedFrames/
 __pycache__/
 .venv/
 *.pyc
