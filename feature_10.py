@@ -14,6 +14,8 @@ Attack: NO limits (natural positioning)
 
 Usage:
     python feature_10.py --seq v_HdiyOtliFiw_c003 --frames 300
+    python feature_10.py --seq v_HdiyOtliFiw_c003 --frames 100 --play
+    python feature_10.py --seq v_HdiyOtliFiw_c003 --frames 50 --no-video
 """
 
 from __future__ import annotations
@@ -55,6 +57,7 @@ class FormationConfig:
     smoothing_window: int = 10  # frames for formation smoothing
     dot_radius: int = 7
     line_thickness: int = 3
+    video_fps: int = 10
     
     # Min/Max limits for Defense and Midfield (Attack has NO limits)
     defense_min: int = 3
@@ -382,6 +385,42 @@ def draw_header(
     return np.vstack([header, frame])
 
 
+def play_video(video_path: Path, fps: int = 25) -> None:
+    """Play the generated video file."""
+    cap = cv2.VideoCapture(str(video_path))
+    
+    if not cap.isOpened():
+        print(f"Error: Could not open video {video_path}")
+        return
+    
+    print(f"Playing video: {video_path}")
+    print("Press 'q' or ESC to quit, SPACE to pause/resume")
+    
+    paused = False
+    while True:
+        if not paused:
+            ret, frame = cap.read()
+            if not ret:
+                break
+        
+        if not paused and ret:
+            cv2.imshow("Feature 10 - Formation Analysis", frame)
+        
+        key = cv2.waitKey(30 if not paused else 0) & 0xFF
+        
+        if key == ord('q') or key == 27:
+            break
+        elif key == ord(' '):
+            paused = not paused
+            if paused:
+                print("Paused... Press SPACE to resume")
+            else:
+                print("Resuming...")
+    
+    cap.release()
+    cv2.destroyAllWindows()
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Print coordinates
 # ══════════════════════════════════════════════════════════════════════
@@ -455,7 +494,9 @@ def process_sequence(
     seq_name: str,
     n_frames: int = 300,
     verbose: bool = True,
-    print_coords: bool = True
+    print_coords: bool = True,
+    save_video: bool = True,
+    play_video_flag: bool = False
 ) -> None:
     """Process sequence and generate formation analysis."""
     here = Path(__file__).parent
@@ -493,6 +534,10 @@ def process_sequence(
     print(f"  Attack: NO limits (natural positioning)")
     print(f"  Logic: Defense first for both teams, then midfield using opponent's defense avg")
     print(f"  Colors: HOME=GREEN, AWAY=ORANGE")
+    if save_video:
+        print(f"  Video generation: ENABLED")
+    if play_video_flag:
+        print(f"  Video playback: ENABLED (after processing)")
     print(f"{'='*60}\n")
     
     home_track_ids, away_track_ids, per_frame_labels = load_team_labels(f8_out, set(frame_indices))
@@ -525,6 +570,25 @@ def process_sequence(
         log_file.write(f"Limits: Defense={cfg.defense_min}-{cfg.defense_max}, Midfield={cfg.midfield_min}-{cfg.midfield_max}\n")
         log_file.write(f"Attack: NO limits\n")
         log_file.write(f"{'='*60}\n\n")
+    
+    # Setup video writer
+    video_writer = None
+    video_path = output_dir / "output_video.mp4"
+    header_h = 70  # Header height from draw_header
+    
+    if save_video:
+        first_fi = frame_indices[0]
+        first_fp = _frame_path_for_idx(all_paths, first_fi)
+        if first_fp:
+            first_frame = cv2.imread(first_fp)
+            if first_frame is not None:
+                h, w = first_frame.shape[:2]
+                video_writer = cv2.VideoWriter(
+                    str(video_path),
+                    cv2.VideoWriter_fourcc(*'mp4v'),
+                    cfg.video_fps,
+                    (w, h + header_h)
+                )
     
     for fi in frame_indices:
         fp = _frame_path_for_idx(all_paths, fi)
@@ -591,7 +655,6 @@ def process_sequence(
         if len(home_midfield_ids) < cfg.midfield_min and home_attacking_ids:
             needed = cfg.midfield_min - len(home_midfield_ids)
             if needed <= len(home_attacking_ids):
-                # Move closest players from attack to midfield
                 attack_players = [(tid, x, y) for tid, x, y in home_players_list if tid in home_attacking_ids]
                 attack_players_sorted = sorted(attack_players, key=lambda p: p[1])
                 if home_side == "right":
@@ -682,13 +745,27 @@ def process_sequence(
                 log_file.write(f"  #{tid}: ({x},{y}) - {line}\n")
             log_file.write(f"\n")
         
-        # Save frame
+        # Write to video
+        if video_writer is not None:
+            video_writer.write(frame)
+        
+        # Save frame image (optional - can be disabled for speed)
         frame_path = frames_dir / f"frame_{fi:06d}.jpg"
         cv2.imwrite(str(frame_path), frame)
         frames_saved += 1
         
         if frames_saved % 50 == 0 and verbose:
             print(f"  Processed {frames_saved} frames...")
+    
+    # Release video writer
+    if video_writer is not None:
+        video_writer.release()
+        print(f"\n  Video saved to: {video_path}")
+        
+        # Play video if requested
+        if play_video_flag:
+            print(f"  Playing video...")
+            play_video(video_path, cfg.video_fps)
     
     if log_file:
         log_file.close()
@@ -742,6 +819,10 @@ if __name__ == "__main__":
                        help="Number of frames to process")
     parser.add_argument("--no-coords", action="store_true",
                        help="Don't print coordinates (faster)")
+    parser.add_argument("--no-video", action="store_true",
+                       help="Skip video generation")
+    parser.add_argument("--play", action="store_true",
+                       help="Play the generated video after processing")
     
     args = parser.parse_args()
     
@@ -749,5 +830,7 @@ if __name__ == "__main__":
         seq_name=args.seq,
         n_frames=args.frames,
         verbose=True,
-        print_coords=not args.no_coords
+        print_coords=not args.no_coords,
+        save_video=not args.no_video,
+        play_video_flag=args.play
     )

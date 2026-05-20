@@ -12,6 +12,7 @@ Reads from:
 Writes to:
     output/feature_9/<seq>/overlays/    ← annotated frames (main output)
     output/feature_9/<seq>/colours.txt  ← colour summary per sequence
+    output/feature_9/<seq>/output_video.mp4  ← video output
 
 Each output overlay shows:
   • Coloured bounding boxes per player  (green=home, blue=away, amber=gk, magenta=referee)
@@ -20,13 +21,14 @@ Each output overlay shows:
         home:<colour>  away:<colour>  gk:<colour>
         referee: DETECTED(frame X) | NOT DETECTED
         GK: home→#tid  away→#tid
-        CLASH WARNING  (if home & away colours clash)
 
 Usage
 -----
-    python feature_9.py                        # all sequences
+    python feature_9.py                        # all sequences, first 50 frames
     python feature_9.py --seq v_HdiyOtliFiw_c003
-    python feature_9.py --seq v_HdiyOtliFiw_c003 --frames 50
+    python feature_9.py --seq v_HdiyOtliFiw_c003 --frames 100
+    python feature_9.py --seq v_HdiyOtliFiw_c003 --frames 50 --no-video
+    python feature_9.py --seq v_HdiyOtliFiw_c003 --frames 100 --play
 """
 
 from __future__ import annotations
@@ -75,6 +77,9 @@ _BOX_COLOUR = {
     "referee": (220, 60, 220),  # magenta
     "?": (120, 120, 120),
 }
+
+# Video settings
+_VIDEO_FPS = 10
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -503,6 +508,42 @@ def _draw_boxes(
     return out
 
 
+def play_video(video_path: Path, fps: int = 25) -> None:
+    """Play the generated video file."""
+    cap = cv2.VideoCapture(str(video_path))
+    
+    if not cap.isOpened():
+        print(f"Error: Could not open video {video_path}")
+        return
+    
+    print(f"Playing video: {video_path}")
+    print("Press 'q' or ESC to quit, SPACE to pause/resume")
+    
+    paused = False
+    while True:
+        if not paused:
+            ret, frame = cap.read()
+            if not ret:
+                break
+        
+        if not paused and ret:
+            cv2.imshow("Feature 9 - Jersey Metadata", frame)
+        
+        key = cv2.waitKey(30 if not paused else 0) & 0xFF
+        
+        if key == ord('q') or key == 27:
+            break
+        elif key == ord(' '):
+            paused = not paused
+            if paused:
+                print("Paused... Press SPACE to resume")
+            else:
+                print("Resuming...")
+    
+    cap.release()
+    cv2.destroyAllWindows()
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Main per-sequence runner
 # ══════════════════════════════════════════════════════════════════════
@@ -516,6 +557,8 @@ def run_feature9_sequence(
     iou_thresh: float = 0.5,
     model_name: str = "yolov8m.pt",
     yolo_model: Optional["YOLO"] = None,
+    save_video: bool = True,
+    play_video_flag: bool = False,
 ) -> None:
     seq_name = seq_dir.name
     img_dir = seq_dir / "img1"
@@ -627,8 +670,28 @@ def run_feature9_sequence(
         print(f"[{seq_name}] loading YOLO ({model_name}) …")
         yolo_model = YOLO(model_name)
 
+    # ── Setup video writer ──────────────────────────────────────────
+    video_writer = None
+    video_path = seq_out / "output_video.mp4"
+    
+    if save_video:
+        first_fi = frame_indices[0]
+        first_fp = _frame_path_for_idx(all_paths, first_fi)
+        if first_fp:
+            first_frame = cv2.imread(first_fp)
+            if first_frame is not None:
+                h, w = first_frame.shape[:2]
+                video_writer = cv2.VideoWriter(
+                    str(video_path),
+                    cv2.VideoWriter_fourcc(*'mp4v'),
+                    _VIDEO_FPS,
+                    (w, h + _HEADER_H)
+                )
+
     # ── Per-frame rendering ──────────────────────────────────────────
     referee_count = 0
+    frames_saved = 0
+    
     for fi, entries in sorted(frame_entries.items()):
         fp = _frame_path_for_idx(all_paths, fi)
         if fp is None:
@@ -653,8 +716,27 @@ def run_feature9_sequence(
         # Prepend header bar
         annotated = _draw_header(annotated, fi, colours, gk_ids, referee_box, clash)
 
+        # Save frame image
         out_path = overlays_out / f"frame_{fi:06d}.jpg"
         cv2.imwrite(str(out_path), annotated)
+        frames_saved += 1
+
+        # Write to video
+        if video_writer is not None:
+            video_writer.write(annotated)
+
+        if frames_saved % 50 == 0:
+            print(f"[{seq_name}] processed {frames_saved} frames...")
+
+    # Release video writer
+    if video_writer is not None:
+        video_writer.release()
+        print(f"[{seq_name}] video saved → {video_path}")
+        
+        # Play video if requested
+        if play_video_flag:
+            print(f"[{seq_name}] playing video...")
+            play_video(video_path, _VIDEO_FPS)
 
     print(
         f"[{seq_name}] referee detected in {referee_count}/{len(frame_entries)} frames"
@@ -686,6 +768,8 @@ def run_feature9(
     yolo_conf: float = 0.25,
     iou_thresh: float = 0.5,
     model_name: str = "yolov8m.pt",
+    save_video: bool = True,
+    play_video_flag: bool = False,
 ) -> None:
     here = Path(__file__).parent
     videos_root = _DATASET_ROOT
@@ -708,6 +792,10 @@ def run_feature9(
     print(
         f"Feature 9 — processing {len(seq_dirs)} sequence(s), first {first_n} frames each"
     )
+    if save_video:
+        print("  Video generation: ENABLED")
+    if play_video_flag:
+        print("  Video playback: ENABLED (after processing)")
 
     # Load YOLO once and reuse across sequences
     print(f"Loading YOLO model: {model_name}")
@@ -722,6 +810,8 @@ def run_feature9(
             iou_thresh=iou_thresh,
             model_name=model_name,
             yolo_model=yolo_model,
+            save_video=save_video,
+            play_video_flag=play_video_flag,
         )
 
     print("\nFeature 9 complete.")
@@ -765,6 +855,17 @@ if __name__ == "__main__":
         default="yolov8m.pt",
         help="YOLO model weights (default: yolov8m.pt)",
     )
+    parser.add_argument(
+        "--no-video",
+        action="store_true",
+        help="Skip video generation",
+    )
+    parser.add_argument(
+        "--play",
+        action="store_true",
+        help="Play the generated video after processing",
+    )
+    
     args = parser.parse_args()
 
     run_feature9(
@@ -773,4 +874,6 @@ if __name__ == "__main__":
         yolo_conf=args.conf,
         iou_thresh=args.iou,
         model_name=args.model,
+        save_video=not args.no_video,
+        play_video_flag=args.play,
     )
