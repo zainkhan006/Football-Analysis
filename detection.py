@@ -1,9 +1,12 @@
 # feature 1
 
+import argparse
+from pathlib import Path
 import cv2
 from ultralytics import YOLO
 import config
 import dataLoader
+
 
 def loadModel():
     modelPath = config.yoloPlayerModel
@@ -32,11 +35,33 @@ def detect(frame, model):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="feature 1 player detection")
+    parser.add_argument("--input", type=str, default=None,
+                        help="optional path to a sportsmot sequence folder or a video file. defaults to config.testSequencePath")
+    args = parser.parse_args()
+
+    if(args.input is None):
+        inputPath = config.testSequencePath
+    else:
+        inputPath = Path(args.input)
+
+    if(not inputPath.exists()):
+        print(f"input path does not exist {inputPath}")
+        exit(1)
+
+    isVideo = inputPath.is_file()
+
     print("loading yolov8n model")
     model = loadModel()
     print("model loaded")
-    print("loading first frame of test sequence")
-    seqGen = dataLoader.loadSequence(config.testSequencePath)
+
+    if(isVideo):
+        print(f"loading first frame of video {inputPath.name}")
+        seqGen = dataLoader.loadVideo(inputPath)
+    else:
+        print(f"loading first frame of sportsmot sequence {inputPath.name}")
+        seqGen = dataLoader.loadSequence(inputPath)
+
     data = next(seqGen)
     frame = data["frame"].copy()
     gtBoxes = data["boxes"]
@@ -44,6 +69,7 @@ if __name__ == "__main__":
     print("running yolo detection")
     detections = detect(frame, model)
     print(f"yolo detected {len(detections)} players")
+
     for trackId, x, y, w, h in gtBoxes:
         cv2.rectangle(frame, (int(x), int(y)), (int(x + w), int(y + h)), (0, 0, 255), 1)
 
@@ -56,4 +82,7 @@ if __name__ == "__main__":
     outPath = config.outputsDir / "detection_test.jpg"
     cv2.imwrite(str(outPath), frame)
     print(f"saved annotated frame to {outPath}")
-    print("red = ground truth, green = yolo, open the file to compare")
+    if(isVideo):
+        print("green = yolo detections, no gt available for video input")
+    else:
+        print("red = ground truth, green = yolo, open the file to compare")

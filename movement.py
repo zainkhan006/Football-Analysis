@@ -1,9 +1,14 @@
 # feature 5
+# feature 5
+import argparse
+from pathlib import Path
 import numpy as np
 import cv2
 import config
 import dataLoader
 import opticalFlow
+import detection
+import tracking
 from homography import PitchHomography
 import matplotlib.pyplot as plt
 
@@ -140,63 +145,139 @@ def analysePlayer(targetPositionsPx, cameraMotions, homography, frameRate):
 
 
 if(__name__ == "__main__"):
-    print("running movement self-check on test sequence")
+    parser = argparse.ArgumentParser(description="feature 5 player movement analysis")
+    parser.add_argument("--input", type=str, default=None,
+                        help="optional path to a sportsmot sequence folder or a video file. defaults to config.testSequencePath")
+    parser.add_argument("--homo", type=str, default=None,
+                        help="optional path to a homography .npz file. required when input is a video, defaults to homographies/<seqName>.npz for sportsmot")
+    args = parser.parse_args()
 
-    seqPath = config.testSequencePath
-    info = dataLoader.readSeqInfo(seqPath)
-    gt = dataLoader.readGroundTruth(seqPath)
-    frameRate = info["frameRate"]
+    if(args.input is None):
+        inputPath = config.testSequencePath
+    else:
+        inputPath = Path(args.input)
 
-    print(f"  sequence {info['name']}, {info['seqLength']} frames at {frameRate} fps")
+    if(not inputPath.exists()):
+        print(f"input path does not exist {inputPath}")
+        exit(1)
 
-    homoPath = config.projectRoot / "homographies" / f"{info['name']}.npz"
+    isVideo = inputPath.is_file()
+
+    # resolve frame rate, sequence name, and homography
+    if(isVideo):
+        seqName = inputPath.stem
+        frameRate = dataLoader.videoFrameRate(inputPath)
+        print(f"running movement on video {inputPath.name}, {frameRate:.0f} fps")
+        if(args.homo is None):
+            print("homography path is required for video input. pass --homo <path>")
+            exit(1)
+        homoPath = Path(args.homo)
+    else:
+        info = dataLoader.readSeqInfo(inputPath)
+        seqName = info["name"]
+        frameRate = info["frameRate"]
+        print(f"running movement on sportsmot sequence {seqName}, {info['seqLength']} frames at {frameRate} fps")
+        if(args.homo is None):
+            homoPath = config.projectRoot / "homographies" / f"{seqName}.npz"
+        else:
+            homoPath = Path(args.homo)
+
     if(not homoPath.exists()):
-        print(f"  homography file not found at {homoPath}")
-        print(f"  run compute_homographies.py first")
+        print(f"homography file not found at {homoPath}")
+        print("run compute_homographies.py first for sportsmot, or pass an existing .npz with --homo")
         exit(1)
-
     homo = PitchHomography.load(str(homoPath))
-    print(f"  loaded homography from {homoPath.name}")
+    print(f"loaded homography from {homoPath.name}")
 
-    if(1 not in gt or len(gt[1]) == 0):
-        print("  no gt boxes in frame 1, cannot pick target player")
-        exit(1)
-    targetId = gt[1][0][0]
-    print(f"  target player set to track id {targetId}")
+    numFrames = 200
 
-    numFrames = min(200, info["seqLength"])
+    # collect frames, target positions, and camera motions
+    # path branches because video has no gt and needs yolo + bytetrack to find a player to follow
+    if(isVideo):
+        print("loading yolo model for video tracking")
+        model = detection.loadModel()
 
-    print(f"loading {numFrames} frames for self-check")
-    frames = []
-    targetPositions = []
-    for i, data in enumerate(dataLoader.loadSequence(seqPath)):
-        if(i >= numFrames):
-            break
-        frames.append(data["frame"])
-        found = None
-        for trackId, x, y, w, h in data["boxes"]:
-            if(trackId == targetId):
-                found = (x, y, w, h)
+        print(f"running yolo + bytetrack across up to {numFrames} frames")
+        allTracks = []
+        idCounts = {}
+        framesProcessed = 0
+        for data in dataLoader.loadVideo(inputPath):
+            if(framesProcessed >= numFrames):
                 break
-        targetPositions.append(found)
+            frame = data["frame"]
+            yoloTracks = tracking.trackYolo(frame, model)
+            frameTracks = [(t["trackId"], t["bbox"][0], t["bbox"][1], t["bbox"][2], t["bbox"][3]) for t in yoloTracks]
+            allTracks.append(frameTracks)
+            for trackId, *_ in frameTracks:
+                idCounts[trackId] = idCounts.get(trackId, 0) + 1
+            framesProcessed += 1
+            if(framesProcessed % 50 == 0):
+                print(f"  processed frame {framesProcessed}")
 
-    framesPresent = sum(1 for p in targetPositions if p is not None)
-    print(f"  target player visible in {framesPresent}/{numFrames} frames")
+        print(f"processed {framesProcessed} frames, found {len(idCounts)} unique track ids")
 
-    print("computing camera motion across self-check window")
-    cameraMotions = [(0.0, 0.0)]
-    cumX, cumY = 0.0, 0.0
-    for i in range(1, len(frames)):
-        prevBoxes = []
-        if(i in gt):
-            prevBoxes = [(x, y, w, h) for _, x, y, w, h in gt[i]]
-        (dx, dy), _, _ = opticalFlow.computeCameraMotion(frames[i - 1], frames[i], prevBoxes)
-        cumX += dx
-        cumY += dy
-        cameraMotions.append((cumX, cumY))
+        if(len(idCounts) == 0):
+            print("no tracks found in video, cannot pick target player")
+            exit(1)
 
-    print(f"  total camera drift: ({cumX:.1f}, {cumY:.1f}) px")
+        # auto-pick the longest-lived track (option A)
+        targetId = max(idCounts, key=idCounts.get)
+        print(f"auto-picked track id {targetId} as target (visible in {idCounts[targetId]} of {framesProcessed} frames)")
 
+        targetPositions = []
+        for frameTracks in allTracks:
+            found = None
+            for trackId, x, y, w, h in frameTracks:
+                if(trackId == targetId):
+                    found = (x, y, w, h)
+                    break
+            targetPositions.append(found)
+
+        # static cam assumption for video, mirrors what heatmap does
+        cameraMotions = [(0.0, 0.0)] * len(allTracks)
+        numFrames = len(allTracks)
+
+    else:
+        gt = dataLoader.readGroundTruth(inputPath)
+        if(1 not in gt or len(gt[1]) == 0):
+            print("no gt boxes in frame 1, cannot pick target player")
+            exit(1)
+        targetId = gt[1][0][0]
+        print(f"target player set to gt track id {targetId}")
+
+        numFrames = min(numFrames, info["seqLength"])
+
+        print(f"loading {numFrames} frames for analysis")
+        frames = []
+        targetPositions = []
+        for i, data in enumerate(dataLoader.loadSequence(inputPath)):
+            if(i >= numFrames):
+                break
+            frames.append(data["frame"])
+            found = None
+            for trackId, x, y, w, h in data["boxes"]:
+                if(trackId == targetId):
+                    found = (x, y, w, h)
+                    break
+            targetPositions.append(found)
+
+        framesPresent = sum(1 for p in targetPositions if p is not None)
+        print(f"target player visible in {framesPresent}/{numFrames} frames")
+
+        print("computing camera motion across analysis window")
+        cameraMotions = [(0.0, 0.0)]
+        cumX, cumY = 0.0, 0.0
+        for i in range(1, len(frames)):
+            prevBoxes = []
+            if(i in gt):
+                prevBoxes = [(x, y, w, h) for _, x, y, w, h in gt[i]]
+            (dx, dy), _, _ = opticalFlow.computeCameraMotion(frames[i - 1], frames[i], prevBoxes)
+            cumX += dx
+            cumY += dy
+            cameraMotions.append((cumX, cumY))
+        print(f"total camera drift ({cumX:.1f}, {cumY:.1f}) px")
+
+    # common analysis path
     print("running player analysis")
     result = analysePlayer(targetPositions, cameraMotions, homo, frameRate)
 
@@ -208,7 +289,7 @@ if(__name__ == "__main__"):
         durationSec = (e - s + 1) / frameRate
         print(f"    sprint {i + 1}: frames {s}-{e} ({durationSec:.1f}s), peak {peak:.1f} km/h")
 
-    #speed graph hehe
+    # trajectory and speed profile plot
     pitchL = 105.0
     pitchW = 68.0
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -221,13 +302,15 @@ if(__name__ == "__main__"):
     ax1.add_patch(plt.Circle((pitchL / 2, pitchW / 2), 9.15, color="white", fill=False, linewidth=1))
     wxs = [p[0] for p in result["worldPositions"]]
     wys = [p[1] for p in result["worldPositions"]]
-    ax1.plot(wxs, wys, color="yellow", linewidth=1.2, alpha=0.7)
-    ax1.scatter(wxs[0], wys[0], color="lime", s=60, zorder=5, label="start")
-    ax1.scatter(wxs[-1], wys[-1], color="red", s=60, zorder=5, label="end")
+    if(len(wxs) > 0):
+        ax1.plot(wxs, wys, color="yellow", linewidth=1.2, alpha=0.7)
+        ax1.scatter(wxs[0], wys[0], color="lime", s=60, zorder=5, label="start")
+        ax1.scatter(wxs[-1], wys[-1], color="red", s=60, zorder=5, label="end")
     ax1.set_xlabel("pitch length (m)")
     ax1.set_ylabel("pitch width (m)")
-    ax1.set_title(f"player trajectory  —  {result['totalDistanceM']:.1f}m covered")
+    ax1.set_title(f"player {targetId} trajectory  -  {result['totalDistanceM']:.1f}m covered")
     ax1.legend(fontsize=8)
+
     ax2 = axes[1]
     ax2.plot(result["validFrames"], result["smoothedSpeeds"], color="#2980b9", linewidth=1.5, label="smoothed speed")
     ax2.axhline(config.sprintSpeedThresholdKmh, color="red", linestyle="--", linewidth=1, label=f"sprint threshold ({config.sprintSpeedThresholdKmh} km/h)")
@@ -235,11 +318,12 @@ if(__name__ == "__main__"):
         ax2.axvspan(result["validFrames"][s], result["validFrames"][e], alpha=0.2, color="red")
     ax2.set_xlabel("frame")
     ax2.set_ylabel("speed (km/h)")
-    ax2.set_title(f"speed profile  —  peak {result['peakSpeedKmh']:.1f} km/h")
+    ax2.set_title(f"speed profile  -  peak {result['peakSpeedKmh']:.1f} km/h")
     ax2.legend(fontsize=8)
     plt.tight_layout()
+
     outPath = config.outputsDir / "movement_validation.png"
     plt.savefig(str(outPath), dpi=120)
     plt.close()
-    print(f"  saved validation plot to {outPath}")
-    print("movement self-check done")
+    print(f"saved validation plot to {outPath}")
+    print("movement analysis done")

@@ -155,7 +155,6 @@ def videoFrameRate(videoPath):
 
 
 def iterateFrames(inputPath, isVideo):
-    """yields (frameId, frame) from either a sportsmot sequence folder or a video file"""
     if(isVideo):
         cap = cv2.VideoCapture(str(inputPath))
         frameId = 1
@@ -163,8 +162,10 @@ def iterateFrames(inputPath, isVideo):
             ret, frame = cap.read()
             if(not ret):
                 break
-            if(frameId % 2  == 0):
+            if(frameId % 2 == 0):
                 yield frameId, frame
+            if(frameId >= 3000):
+                break
             frameId += 1
         cap.release()
     else:
