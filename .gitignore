@@ -4,6 +4,7 @@ homographies/
 weights/
 models/
 outputs/
+output/
 outputs/annotatedFrames/
 __pycache__/
 .venv/
