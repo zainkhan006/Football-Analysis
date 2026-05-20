@@ -37,18 +37,24 @@ Folder layout expected
         <seq_name>/
           crops_frame_001.jpg
           overlay_frame_001.jpg
+          team_labels.json    ← structured team labels for Feature 10
+          output_video.mp4    ← video output
           …
 
 Usage (script mode)
 -------------------
-    python feature_8.py                        # all sequences, first 50 frames
+    python feature_8.py                              # all sequences, first 50 frames
     python feature_8.py --seq v_HdiyOtliFiw_c003
-    python feature_8.py --seq v_HdiyOtliFiw_c003 --frames 155 200
+    python feature_8.py --seq v_HdiyOtliFiw_c003 --frames 100
+    python feature_8.py --seq v_HdiyOtliFiw_c003 --frames 50 --no-video
+    python feature_8.py --seq v_HdiyOtliFiw_c003 --frames 100 --play
 """
 
 from __future__ import annotations
 
+import json
 import os
+import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -60,7 +66,7 @@ try:
     _DATASET_ROOT = config.datasetRoot / config.testSplit
 except ImportError:
     config = None
-    _DATASET_ROOT = Path(r"C:\Users\Zain Ul Ibad\Desktop\projects\cv_project\sportsmot_publish\dataset\train")
+    _DATASET_ROOT = Path(r"C:\Users\samee\Documents\Computer Vision\project\videos")
 
 # ══════════════════════════════════════════════════════════════════════
 # Configuration
@@ -121,6 +127,9 @@ class FeatureConfig:
     # ── Debug strip output ────────────────────────────────────────────
     tile_w: int = 64
     tile_h: int = 112
+    
+    # ── Video settings ────────────────────────────────────────────────
+    video_fps: int = 10
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -740,6 +749,70 @@ def draw_overlay(
     return out
 
 
+def add_header_to_frame(
+    frame: np.ndarray,
+    frame_idx: int,
+    home_count: int,
+    away_count: int,
+    gk_count: int
+) -> np.ndarray:
+    """Add header information to the top of the frame."""
+    h, w = frame.shape[:2]
+    header_h = 60
+    header = np.zeros((header_h, w, 3), dtype=np.uint8)
+    header[:] = (30, 30, 30)
+    
+    # Frame info
+    cv2.putText(header, f"Frame: {frame_idx:06d}", (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    # Team counts
+    cv2.putText(header, f"HOME: {home_count}", (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 200, 60), 1)
+    cv2.putText(header, f"AWAY: {away_count}", (200, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 120, 220), 1)
+    cv2.putText(header, f"GK: {gk_count}", (380, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 180, 40), 1)
+    
+    return np.vstack([header, frame])
+
+
+def play_video(video_path: Path, fps: int = 25) -> None:
+    """Play the generated video file."""
+    cap = cv2.VideoCapture(str(video_path))
+    
+    if not cap.isOpened():
+        print(f"Error: Could not open video {video_path}")
+        return
+    
+    print(f"Playing video: {video_path}")
+    print("Press 'q' or ESC to quit, SPACE to pause/resume")
+    
+    paused = False
+    while True:
+        if not paused:
+            ret, frame = cap.read()
+            if not ret:
+                break
+        
+        if not paused and ret:
+            cv2.imshow("Feature 8 - Team Assignment", frame)
+        
+        key = cv2.waitKey(30 if not paused else 0) & 0xFF
+        
+        if key == ord('q') or key == 27:  # q or ESC
+            break
+        elif key == ord(' '):  # space to pause/resume
+            paused = not paused
+            if paused:
+                print("Paused... Press SPACE to resume")
+            else:
+                print("Resuming...")
+    
+    cap.release()
+    cv2.destroyAllWindows()
+
+
 # ══════════════════════════════════════════════════════════════════════
 # GT / filesystem helpers
 # ══════════════════════════════════════════════════════════════════════
@@ -800,6 +873,8 @@ def run_feature8(
     seq_filter:    Optional[str]      = None,
     explicit_frames: Optional[List[int]] = None,
     first_n:       int                = DEFAULT_FIRST_N,
+    save_video:    bool               = True,
+    play_video_flag: bool             = False,
 ) -> None:
     """
     Walk videos/<seq>/img1/, process frames, write to output/feature_8/<seq>/.
@@ -815,6 +890,13 @@ def run_feature8(
           overlays/
             overlay_frame_001.jpg  ← full frame with coloured bboxes (S2 labels)
             …
+          jersey_crops/            ← individual jersey crops per team
+            home/
+            away/
+            gk/
+          team_labels.json         ← structured team labels for Feature 10
+          output_video.mp4         ← video output
+          gk_rescue_log.txt
 
     Parameters
     ----------
@@ -823,6 +905,8 @@ def run_feature8(
                       Otherwise takes the first `first_n` frames found in img1/.
     first_n         : how many leading frames to process when explicit_frames
                       is not given (default 50).
+    save_video      : whether to save output video (default True)
+    play_video_flag : whether to play the video after generation (default False)
     """
     here        = Path(__file__).parent
     # Dataset root comes from config.py so the path stays consistent with
@@ -959,11 +1043,44 @@ def run_feature8(
                 f.write("No tracks were rescued from gk.\n")
         print(f"[{seq_dir.name}] rescue log → {log_path}")
 
-
         print(f"[{seq_dir.name}] majority-vote final assignments: "
               + ", ".join(f"#{tid}->{lbl}" for tid, lbl in sorted(voted.items())))
 
-        # ── Pass 2: write visualisation images using stable labels ────
+        # ── Save team labels JSON for Feature 10 ─────────────────────
+        team_labels_json = {
+            "sequence": seq_dir.name,
+            "home_track_ids": [tid for tid, lbl in voted.items() if lbl == "home"],
+            "away_track_ids": [tid for tid, lbl in voted.items() if lbl == "away"],
+            "gk_track_ids": [tid for tid, lbl in voted.items() if lbl == "gk"],
+            "per_frame": {str(fi): labels for fi, labels in stable_labels.items()},
+            "final_per_track": {str(tid): lbl for tid, lbl in voted.items()}
+        }
+        
+        json_path = seq_out / "team_labels.json"
+        with open(json_path, "w") as f:
+            json.dump(team_labels_json, f, indent=2)
+        print(f"[{seq_dir.name}] team labels JSON → {json_path}")
+
+        # ── Pass 2: write visualisation images and create video ────
+        video_writer = None
+        video_path = seq_out / "output_video.mp4"
+        
+        if save_video:
+            # Get first frame to determine video dimensions
+            first_fi = frame_indices[0]
+            first_fp = _frame_path_for_idx(all_frame_paths, first_fi)
+            if first_fp:
+                first_frame = cv2.imread(first_fp)
+                if first_frame is not None:
+                    h, w = first_frame.shape[:2]
+                    # Add header height
+                    video_writer = cv2.VideoWriter(
+                        str(video_path),
+                        cv2.VideoWriter_fourcc(*'mp4v'),
+                        cfg.video_fps,
+                        (w, h + 60)  # +60 for header
+                    )
+        
         for fi, entries in sorted(frame_entries.items()):
             fp = _frame_path_for_idx(all_frame_paths, fi)
             if fp is None:
@@ -973,12 +1090,30 @@ def run_feature8(
                 continue
 
             labels = stable_labels[fi]
-
-            strip   = build_labelled_strip(frame, entries, labels, cfg)
-            cv2.imwrite(str(crops_out / f"crops_frame_{fi:03d}.jpg"), strip)
-
+            
+            # Draw overlay on frame
             overlay = draw_overlay(frame, entries, labels)
-            cv2.imwrite(str(overlays_out / f"overlay_frame_{fi:03d}.jpg"), overlay)
+            
+            # Add header with counts
+            counts = {"home": 0, "away": 0, "gk": 0}
+            for v in labels.values():
+                if v in counts:
+                    counts[v] += 1
+            
+            overlay_with_header = add_header_to_frame(
+                overlay, fi, counts["home"], counts["away"], counts["gk"]
+            )
+            
+            # Save individual frame image
+            cv2.imwrite(str(overlays_out / f"overlay_frame_{fi:03d}.jpg"), overlay_with_header)
+            
+            # Write to video
+            if video_writer is not None:
+                video_writer.write(overlay_with_header)
+            
+            # Save crop strip (optional, can be disabled for speed)
+            strip = build_labelled_strip(frame, entries, labels, cfg)
+            cv2.imwrite(str(crops_out / f"crops_frame_{fi:03d}.jpg"), strip)
 
             # Save individual jersey crops per team
             for tid, bbox in entries:
@@ -992,16 +1127,21 @@ def run_feature8(
                 team_dir.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(team_dir / f"frame_{fi:03d}_track_{tid}.jpg"), jersey)
 
-
-            counts: Dict[str, int] = {}
-            for v in labels.values():
-                counts[v] = counts.get(v, 0) + 1
-
             print(f"[{seq_dir.name}] frame {fi:4d} | "
                   f"tracks={len(entries):2d} | "
-                  f"home={counts.get('home',0):2d}  "
-                  f"away={counts.get('away',0):2d}  "
-                  f"gk={counts.get('gk',0):2d}")
+                  f"home={counts['home']:2d}  "
+                  f"away={counts['away']:2d}  "
+                  f"gk={counts['gk']:2d}")
+        
+        # Release video writer
+        if video_writer is not None:
+            video_writer.release()
+            print(f"[{seq_dir.name}] video saved → {video_path}")
+            
+            # Play video if requested
+            if play_video_flag:
+                print(f"[{seq_dir.name}] playing video...")
+                play_video(video_path, cfg.video_fps)
 
         print(f"[{seq_dir.name}] done → crops: {crops_out} | overlays: {overlays_out}")
 
@@ -1012,12 +1152,23 @@ def run_feature8(
 
 if __name__ == "__main__":
 
-    # ── DEFINE WHICH SEQUENCE TO RUN ──────────────────────────────────
-    SEQ_NAME = "v_HdiyOtliFiw_c003"  # ← CHANGE THIS to your sequence name
+    parser = argparse.ArgumentParser(description="Feature 8 - Team Assignment")
+    parser.add_argument("--seq", type=str, default="v_2QhNRucNC7E_c017",
+                        help="Sequence folder name inside videos/")
+    parser.add_argument("--frames", type=int, default=None,
+                        help="Number of frames to process (default: all frames)")
+    parser.add_argument("--no-video", action="store_true",
+                        help="Skip video generation")
+    parser.add_argument("--play", action="store_true",
+                        help="Play the generated video after processing")
+    
+    args = parser.parse_args()
+    
+    SEQ_NAME = args.seq
     
     # Dataset root comes from config.py — update config.testSplit if you
     # need to run on a different split (e.g. "train").
-    videos_root = config.datasetRoot / "train" if config is not None else Path(r"C:\Users\Zain Ul Ibad\Desktop\projects\cv_project\sportsmot_publish\dataset\train")
+    videos_root = config.datasetRoot / "train" if config is not None else Path(r"C:\Users\samee\Documents\Computer Vision\project\videos")
     
     # Process ONLY the specified sequence
     seq_dir = videos_root / SEQ_NAME
@@ -1033,9 +1184,16 @@ if __name__ == "__main__":
         if _frame_index_of(p) >= 0
     )
     
-    print(f"Processing {len(all_frame_indices)} frames from {seq_dir.name}")
+    # Limit frames if specified
+    if args.frames:
+        all_frame_indices = all_frame_indices[:args.frames]
+        print(f"Processing {len(all_frame_indices)} frames (first {args.frames}) from {seq_dir.name}")
+    else:
+        print(f"Processing all {len(all_frame_indices)} frames from {seq_dir.name}")
     
     run_feature8(
         seq_filter=seq_dir.name,
         explicit_frames=all_frame_indices,
+        save_video=not args.no_video,
+        play_video_flag=args.play,
     )
