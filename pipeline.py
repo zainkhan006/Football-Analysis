@@ -2,15 +2,9 @@
 
 """
 Integration pipeline for the football analysis project.
-
-This is a thin orchestrator. It does not contain feature logic itself.
-It shows a numbered menu, asks which clip to run on, then hands off to
-the relevant feature module.
-
-Feature to clip mapping:
-  features 1, 2, 3, 4, 8, 9, 11  -> work on both SportsMOT and staticCam
-  features 5, 7                  -> SportsMOT sequences only
-  features 6, 10                 -> staticCam videos only
+  features 1, 2, 3, 4, 8, 9, 11: work on both SportsMOT and staticCam
+  features 5, 7: SportsMOT sequences only
+  features 6, 10: staticCam videos only
 
 Run:
     python pipeline.py
