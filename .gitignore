@@ -8,4 +8,4 @@ output/
 outputs/annotatedFrames/
 __pycache__/
 .venv/
-*.pyc
+*.pyc"models/" 
