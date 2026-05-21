@@ -7,7 +7,6 @@ from ultralytics import YOLO
 import config
 import dataLoader
 
-
 def loadModel():
     modelPath = config.yoloPlayerModel
     if modelPath.exists():

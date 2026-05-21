@@ -1,7 +1,5 @@
 # feature 4
 
-# feature 4
-
 import argparse
 from pathlib import Path
 import cv2
